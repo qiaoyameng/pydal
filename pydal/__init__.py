@@ -19,13 +19,14 @@ from .base import DAL
 from .helpers.classes import SQLCustomType
 from .helpers.methods import geoLine, geoPoint, geoPolygon
 from .objects import Field
-from .querybuilder import QueryBuilder, QueryParseError
+from .querybuilder import QueryBuilder, QueryBuilderConfigError, QueryParseError
 
 __all__ = [
     "DAL",
     "Field",
     "SQLCustomType",
     "QueryBuilder",
+    "QueryBuilderConfigError",
     "QueryParseError",
     "geoLine",
     "geoPoint",

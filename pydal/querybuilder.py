@@ -5,6 +5,17 @@ Natural-language ``Query`` parser.
 ``"name is equal to Chair and price > 10"`` into a pydal ``Query`` you
 can pass to ``db(...)``.
 
+Two parsing modes are available:
+
+* ``legacy`` (default): the historical left-to-right grammar, kept
+  unchanged so existing expressions keep their meaning;
+* ``standard``: an explicit boolean grammar where ``not`` binds
+  tighter than ``and``, which binds tighter than ``or``, and
+  parentheses override precedence. The whole input is tokenized
+  first (fields, operators, values), then a ``Query`` is built, so
+  syntax errors carry character offsets into the *original* input,
+  even inside nested parentheses.
+
 Recognized vocabulary (extensible via ``token_aliases``):
 
 * logical operators: ``not``, ``and``, ``or``;
@@ -24,7 +35,7 @@ authoritative grammar.
 """
 
 import re
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from .objects import Field
 from .validators import (
@@ -37,7 +48,32 @@ from .validators import (
 
 
 class QueryParseError(RuntimeError):
-    """Raised by ``QueryBuilder.parse`` when input can't be parsed."""
+    """
+    Raised by ``QueryBuilder.parse`` when input can't be parsed.
+
+    ``start``/``end`` hold the offending character range within the
+    original input string when known (always set in ``standard``
+    mode); both are ``None`` for errors without position info.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+    ):
+        if start is not None and end is not None:
+            message = f"{message} (characters {start}-{end})"
+        super().__init__(message)
+        self.start = start
+        self.end = end
+
+
+class QueryBuilderConfigError(RuntimeError):
+    """
+    Raised by ``QueryBuilder.__init__`` when the configuration is
+    inconsistent (e.g. an alias collides with a reserved word).
+    """
 
 
 def validate(field: Field, value: Any) -> None:
@@ -135,6 +171,8 @@ class QueryBuilder:
         field_aliases: Optional[Dict[str, str]] = None,
         token_aliases: Optional[Dict[str, str]] = None,
         debug: bool = False,
+        mode: str = "legacy",
+        max_depth: Optional[int] = 32,
     ):
         """
         Construct a parser bound to ``table``.
@@ -149,8 +187,31 @@ class QueryBuilder:
         ``tokens_and_or``. Defaults to ``default_token_aliases``.
 
         ``debug``: print each token match to stdout while parsing.
+
+        ``mode``: ``"legacy"`` (default) keeps the historical
+        left-to-right grammar; ``"standard"`` enables the explicit
+        boolean grammar (``not`` > ``and`` > ``or``, parentheses
+        override, consecutive ``not`` allowed, position-aware
+        errors). The default never changes, so existing expressions
+        keep their meaning unless ``standard`` is requested.
+
+        ``max_depth``: maximum parenthesis nesting depth accepted in
+        ``standard`` mode (``None`` for unlimited). Exceeding it
+        raises ``QueryParseError`` pointing at the offending ``(``.
+
+        In ``standard`` mode the configuration is validated eagerly:
+        aliases colliding with reserved logical words, aliases
+        targeting unknown tokens, or aliases redefining canonical
+        operators raise ``QueryBuilderConfigError`` here instead of
+        failing (or being silently ignored) at parse time.
         """
+        if mode not in ("legacy", "standard"):
+            raise QueryBuilderConfigError(
+                f"Unknown mode {mode!r}, expected 'legacy' or 'standard'"
+            )
         self.table = table
+        self.mode = mode
+        self.max_depth = max_depth
         # Either override all fields or none.
         if field_aliases:
             self.fields = {k: table[v] for k, v in field_aliases.items()}
@@ -158,6 +219,7 @@ class QueryBuilder:
             self.fields = {f.name.lower(): f for f in table if f.readable}
         if token_aliases is None:
             token_aliases = QueryBuilder.default_token_aliases
+        self.token_aliases = token_aliases
         # Build per-instance token dicts including aliases.
         self.tokens_not = self._augment(token_aliases, QueryBuilder.tokens_not)
         self.tokens_and_or = self._augment(token_aliases, QueryBuilder.tokens_and_or)
@@ -174,6 +236,82 @@ class QueryBuilder:
             + r")\s*(.*)$"
         )
         self.debug = debug
+        if mode == "standard":
+            self._prepare_standard_mode()
+
+    def _prepare_standard_mode(self) -> None:
+        """Precompute lookup tables and validate the configuration."""
+        # Reserved logical words (canonical tokens plus their aliases),
+        # matched case-insensitively in standard mode.
+        self._logical_words = {k.lower(): v for k, v in self.tokens_and_or.items()}
+        self._not_words = {k.lower() for k in self.tokens_not}
+        self._reserved_logical = set(self._logical_words) | self._not_words
+        # Operator phrases as tuples of lowered parts, longest first so
+        # ``is not null`` wins over ``is``.
+        self._op_phrases = sorted(
+            (
+                (tuple(key.lower().split()), canonical)
+                for key, canonical in self.tokens_ops.items()
+            ),
+            key=lambda item: (-len(item[0]), -len(" ".join(item[0]))),
+        )
+        # Symbolic operators (``==``, ``<=``, ...) the lexer must
+        # recognize even without surrounding whitespace, longest first.
+        self._symbol_tokens = sorted(
+            (
+                key
+                for key in self.tokens_ops
+                if " " not in key and not re.match(r"\w", key)
+            ),
+            key=len,
+            reverse=True,
+        )
+        self._validate_standard_config()
+
+    def _validate_standard_config(self) -> None:
+        """
+        Reject configurations where aliases collide with reserved
+        words or with canonical tokens of another class.
+        """
+        for name in self.fields:
+            if name.lower() in self._reserved_logical:
+                raise QueryBuilderConfigError(
+                    f"Field alias {name!r} conflicts with a reserved "
+                    "logical operator; rename the alias"
+                )
+        canonical_logical = QueryBuilder.tokens_not | QueryBuilder.tokens_and_or
+        canonical_all = canonical_logical | QueryBuilder.tokens_ops
+        for alias, target in (self.token_aliases or {}).items():
+            normalized = " ".join(alias.split()).lower()
+            if target not in canonical_all:
+                raise QueryBuilderConfigError(
+                    f"Token alias {alias!r} targets unknown token {target!r}; "
+                    f"expected one of {sorted(canonical_all)}"
+                )
+            if normalized in QueryBuilder.tokens_and_or and (
+                target not in QueryBuilder.tokens_and_or
+            ):
+                raise QueryBuilderConfigError(
+                    f"Token alias {alias!r} conflicts with reserved logical "
+                    f"operator {normalized!r} (cannot map it to {target!r})"
+                )
+            if normalized in QueryBuilder.tokens_not and (
+                target not in QueryBuilder.tokens_not
+            ):
+                raise QueryBuilderConfigError(
+                    f"Token alias {alias!r} conflicts with reserved logical "
+                    f"operator {normalized!r} (cannot map it to {target!r})"
+                )
+            if normalized in QueryBuilder.tokens_ops and target != normalized:
+                raise QueryBuilderConfigError(
+                    f"Token alias {alias!r} redefines canonical operator "
+                    f"{normalized!r} as {target!r}"
+                )
+            if normalized in self._reserved_logical and target not in canonical_logical:
+                raise QueryBuilderConfigError(
+                    f"Token alias {alias!r} collides with a reserved logical "
+                    "operator alias"
+                )
 
     @staticmethod
     def _augment(
@@ -224,7 +362,102 @@ class QueryBuilder:
         """
         Parse ``text`` into a pydal ``Query``.
 
-        The grammar is roughly::
+        Dispatches to the grammar selected by ``self.mode``; returns
+        ``self.table.id > 0`` for empty input (i.e. "all rows").
+        """
+        if self.mode == "standard":
+            return self._parse_standard(text)
+        return self._parse_legacy(text)
+
+    def _parse_standard(self, text: str):
+        """
+        Parse ``text`` with the explicit boolean grammar::
+
+            query     := or_expr
+            or_expr   := and_expr (or and_expr)*
+            and_expr  := not_expr (and not_expr)*
+            not_expr  := not not_expr | primary
+            primary   := '(' or_expr ')' | predicate
+            predicate := field [lower|upper] op [value (',' value)*]
+
+        ``not`` binds tighter than ``and``, which binds tighter than
+        ``or``; parentheses override precedence. The input is lexed
+        in one pass, so every ``QueryParseError`` carries character
+        offsets into the original string.
+        """
+        if self.debug:
+            print("PARSING", repr(text))
+        parser = _StandardParser(self, text)
+        if self.debug:
+            print("TOKENS", parser.tokens)
+        query = parser.parse()
+        return query if query is not None else self.table.id > 0
+
+    def _lex(self, text: str) -> "List[_Token]":
+        """
+        Split ``text`` into tokens, preserving original offsets.
+
+        Double-quoted strings (with ``\\"`` escapes) become ``string``
+        tokens whose content is never interpreted — ``and``, ``or``,
+        commas and parentheses inside them are data, not syntax.
+        Symbolic operators (``==``, ``<=``, ...) are recognized even
+        without surrounding whitespace.
+        """
+        tokens: List[_Token] = []
+        symbols = self._symbol_tokens
+        i, n = 0, len(text)
+        while i < n:
+            c = text[i]
+            if c.isspace():
+                i += 1
+                continue
+            if c == "(":
+                tokens.append(_Token("lparen", c, i, i + 1))
+                i += 1
+                continue
+            if c == ")":
+                tokens.append(_Token("rparen", c, i, i + 1))
+                i += 1
+                continue
+            if c == ",":
+                tokens.append(_Token("comma", c, i, i + 1))
+                i += 1
+                continue
+            if c == '"':
+                j = i + 1
+                prev_c: Optional[str] = None
+                closed = False
+                while j < n:
+                    if text[j] == '"' and prev_c != "\\":
+                        closed = True
+                        break
+                    prev_c = text[j]
+                    j += 1
+                if not closed:
+                    raise QueryParseError("Unterminated string literal", i, n)
+                tokens.append(_Token("string", text[i + 1 : j], i, j + 1))
+                i = j + 1
+                continue
+            symbol = next((s for s in symbols if text.startswith(s, i)), None)
+            if symbol:
+                tokens.append(_Token("op", symbol, i, i + len(symbol)))
+                i += len(symbol)
+                continue
+            j = i
+            while j < n:
+                if text[j].isspace() or text[j] in '(),"':
+                    break
+                if any(text.startswith(s, j) for s in symbols):
+                    break
+                j += 1
+            tokens.append(_Token("word", text[i:j], i, j))
+            i = j
+        tokens.append(_Token("eof", "", n, n))
+        return tokens
+
+    def _parse_legacy(self, text: str):
+        """
+        Parse ``text`` with the historical left-to-right grammar::
 
             query  := atom (and/or atom)*
             atom   := [not] (subexpr | predicate)
@@ -270,7 +503,7 @@ class QueryBuilder:
             if text.startswith("("):
                 i = QueryBuilder._find_closing_bracket(text)
                 token, text = text[1:i], text[i + 1:].strip()
-                query = self.parse(token)
+                query = self._parse_legacy(token)
             else:
                 token, text = next(text, self.re_token)
                 if token.lower() not in self.fields:
@@ -352,3 +585,198 @@ class QueryBuilder:
         if len(stack) > 1:
             raise QueryParseError("Internal error: leftover stack")
         return stack[-1] if stack else self.table.id > 0
+
+
+class _Token(NamedTuple):
+    """One lexed token; ``start``/``end`` index the original input."""
+
+    kind: str  # "word", "string", "op", "lparen", "rparen", "comma", "eof"
+    text: str
+    start: int
+    end: int
+
+    def describe(self) -> str:
+        return "end of input" if self.kind == "eof" else repr(self.text)
+
+
+class _StandardParser:
+    """
+    Recursive-descent parser for ``QueryBuilder``'s standard mode.
+
+    Consumes the token stream produced by ``QueryBuilder._lex``;
+    precedence is ``not`` > ``and`` > ``or`` with parentheses as an
+    escape hatch. All errors reference offsets in the original input.
+    """
+
+    def __init__(self, builder: "QueryBuilder", text: str):
+        self.builder = builder
+        self.text = text
+        self.tokens = builder._lex(text)
+        self.pos = 0
+
+    def peek(self) -> _Token:
+        return self.tokens[self.pos]
+
+    def error(self, message: str, token: _Token) -> None:
+        raise QueryParseError(message, token.start, token.end)
+
+    def parse(self):
+        if self.peek().kind == "eof":
+            return None
+        query = self.parse_or(depth=0)
+        token = self.peek()
+        if token.kind != "eof":
+            self.error(f"Unexpected {token.describe()}", token)
+        return query
+
+    def parse_or(self, depth: int):
+        query = self.parse_and(depth)
+        while self._is_logical("or"):
+            self.pos += 1
+            query = query | self.parse_and(depth)
+        return query
+
+    def parse_and(self, depth: int):
+        query = self.parse_not(depth)
+        while self._is_logical("and"):
+            self.pos += 1
+            query = query & self.parse_not(depth)
+        return query
+
+    def parse_not(self, depth: int):
+        token = self.peek()
+        if token.kind == "word" and token.text.lower() in self.builder._not_words:
+            self.pos += 1
+            # Recursion (not a loop) keeps consecutive ``not``s working.
+            return ~self.parse_not(depth)
+        return self.parse_primary(depth)
+
+    def parse_primary(self, depth: int):
+        token = self.peek()
+        if token.kind == "lparen":
+            max_depth = self.builder.max_depth
+            if max_depth is not None and depth + 1 > max_depth:
+                self.error(
+                    f"Parenthesis nesting exceeds the configured "
+                    f"maximum depth of {max_depth}",
+                    token,
+                )
+            self.pos += 1
+            query = self.parse_or(depth + 1)
+            closing = self.peek()
+            if closing.kind != "rparen":
+                self.error(f"Expected ')', found {closing.describe()}", closing)
+            self.pos += 1
+            return query
+        return self.parse_predicate()
+
+    def parse_predicate(self):
+        builder = self.builder
+        token = self.peek()
+        if token.kind != "word":
+            self.error(f"Expected a field name, found {token.describe()}", token)
+        name = token.text.lower()
+        if name in builder._reserved_logical:
+            self.error(
+                f"Reserved word {token.text!r} cannot be used as a field name",
+                token,
+            )
+        field = builder.fields.get(name, builder.fields.get(token.text))
+        if field is None:
+            self.error(f"Unknown field {token.text!r}", token)
+        self.pos += 1
+        is_text = field.type in ("string", "text", "blob")
+        has_contains = is_text or field.type.startswith("list:")
+        op, op_start, op_end = self._match_operator()
+        # ``lower``/``upper`` modify the field, then expect another op.
+        if is_text and op == "lower":
+            field = field.lower()
+            op, op_start, op_end = self._match_operator()
+        elif is_text and op == "upper":
+            field = field.upper()
+            op, op_start, op_end = self._match_operator()
+        if op == "is null":
+            return field == None  # noqa: E711
+        if op == "is not null":
+            return field != None  # noqa: E711
+        if field.type == "boolean" and op == "is true":
+            return field == True  # noqa: E712
+        if field.type == "boolean" and op == "is false":
+            return field == False  # noqa: E712
+        value = self._match_value()
+        validate(field, value)
+        if op == "==":
+            return field == value
+        if op == "!=":
+            return field != value
+        if op == "<":
+            return field < value
+        if op == ">":
+            return field > value
+        if op == "<=":
+            return field <= value
+        if op == ">=":
+            return field >= value
+        if has_contains and op == "contains":
+            return field.contains(value)
+        if is_text and op == "startswith":
+            return field.startswith(value)
+        if op == "belongs":
+            values = [value]
+            while self.peek().kind == "comma":
+                self.pos += 1
+                item = self._match_value()
+                validate(field, item)
+                values.append(item)
+            return field.belongs(values)
+        raise QueryParseError(
+            f"Operator {op!r} is not supported for field {field.name!r}",
+            op_start,
+            op_end,
+        )
+
+    def _is_logical(self, canonical: str) -> bool:
+        token = self.peek()
+        return (
+            token.kind == "word"
+            and self.builder._logical_words.get(token.text.lower()) == canonical
+        )
+
+    def _match_operator(self) -> Tuple[str, int, int]:
+        """Longest-match an operator phrase; return canonical + span."""
+        for parts, canonical in self.builder._op_phrases:
+            if self._match_parts(parts):
+                start = self.tokens[self.pos].start
+                self.pos += len(parts)
+                return canonical, start, self.tokens[self.pos - 1].end
+        token = self.peek()
+        self.error(f"Expected an operator, found {token.describe()}", token)
+
+    def _match_parts(self, parts: Tuple[str, ...]) -> bool:
+        for offset, part in enumerate(parts):
+            index = self.pos + offset
+            if index >= len(self.tokens):
+                return False
+            token = self.tokens[index]
+            if token.kind == "word" and token.text.lower() == part:
+                continue
+            if token.kind == "op" and token.text == part:
+                continue
+            return False
+        return True
+
+    def _match_value(self) -> str:
+        token = self.peek()
+        if token.kind == "string":
+            self.pos += 1
+            return token.text
+        if token.kind == "word":
+            if token.text.lower() in self.builder._reserved_logical:
+                self.error(
+                    f"Reserved word {token.text!r} must be quoted "
+                    "to be used as a value",
+                    token,
+                )
+            self.pos += 1
+            return token.text
+        self.error(f"Expected a value, found {token.describe()}", token)
