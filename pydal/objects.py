@@ -2128,6 +2128,266 @@ class Expression(object):
         return Query(self.db, self._dialect.json_contains, self, jsonvalue)
 
 
+class RowValue(Expression):
+    """A typed SQL row value made from fields or expressions."""
+
+    __hash__ = object.__hash__
+
+    def __init__(self, *columns, db=None):
+        if len(columns) < 2:
+            raise ValueError("RowValue requires at least two columns")
+        inferred_db = db
+        for column in columns:
+            if isinstance(column, Expression):
+                inferred_db = column.db
+                break
+        if inferred_db is None:
+            raise ValueError("RowValue requires at least two fields or expressions")
+        columns = tuple(columns)
+        for column in columns:
+            if not isinstance(column, Expression):
+                raise TypeError("RowValue columns must be fields or expressions")
+            if not isinstance(getattr(column, "type", None), str):
+                raise TypeError("RowValue columns must have a declared type")
+        super(RowValue, self).__init__(
+            inferred_db,
+            inferred_db._adapter.dialect.row_value,
+            columns,
+            type="row",
+        )
+
+    @property
+    def columns(self):
+        return self.first
+
+    @property
+    def types(self):
+        return tuple(column.type for column in self.columns)
+
+    @staticmethod
+    def _value_type(column_type, value):
+        if value is None:
+            return
+        if isinstance(column_type, SQLCustomType):
+            column_type = column_type.type
+        base_type = REGEX_TYPE.match(column_type).group(0)
+        numeric_types = {
+            "id",
+            "big-id",
+            "integer",
+            "bigint",
+            "float",
+            "double",
+            "boolean",
+        }
+        if base_type in numeric_types or base_type.startswith("decimal") or (
+            base_type in {"reference", "big-reference"}
+        ):
+            valid = isinstance(value, (bool, int, float, decimal.Decimal))
+        elif base_type in {"string", "text", "password", "upload", "json", "jsonb"}:
+            valid = isinstance(value, str)
+        elif base_type == "date":
+            valid = (
+                isinstance(value, datetime.date)
+                and not isinstance(value, datetime.datetime)
+            ) or isinstance(value, str)
+        elif base_type == "time":
+            valid = isinstance(value, datetime.time) or isinstance(value, str)
+        elif base_type == "datetime":
+            valid = isinstance(value, (datetime.date, datetime.datetime, str))
+        else:
+            valid = True
+        if not valid:
+            raise TypeError(
+                "RowValue expected %s but got %r" % (column_type, value)
+            )
+
+    def _check_arity(self, values):
+        arity = len(self.columns)
+        if not isinstance(values, (tuple, list)) or isinstance(values, (str, bytes)):
+            raise TypeError("RowValue comparison requires a row or subquery")
+        if len(values) != arity:
+            raise ValueError(
+                "RowValue dimension mismatch: expected %d, got %d"
+                % (arity, len(values))
+            )
+
+    def _check_row(self, row):
+        self._check_arity(row)
+        for column, value in zip(self.columns, row):
+            if isinstance(value, (tuple, list, set, dict)):
+                raise TypeError("RowValue items must be scalar values")
+            self._value_type(column.type, value)
+
+    def _check_subquery(self, subquery):
+        from . import ast as _ast
+
+        if isinstance(subquery, _ast.Select):
+            columns = subquery.fields
+        elif isinstance(subquery, Select):
+            columns = subquery._qfields
+        else:
+            raise TypeError("RowValue subquery must be a Select")
+        if len(columns) != len(self.columns):
+            raise ValueError(
+                "RowValue subquery dimension mismatch: expected %d, got %d"
+                % (len(self.columns), len(columns))
+            )
+        for left_column, right_column in zip(self.columns, columns):
+            if not self._types_match(left_column.type, self._node_type(right_column)):
+                raise TypeError(
+                    "RowValue subquery type mismatch: expected %s, got %s"
+                    % (left_column.type, self._node_type(right_column))
+                )
+
+    @staticmethod
+    def _node_type(node):
+        return getattr(node, "type", None)
+
+    @staticmethod
+    def _types_match(left_type, right_type):
+        if isinstance(left_type, SQLCustomType):
+            left_type = left_type.type
+        if isinstance(right_type, SQLCustomType):
+            right_type = right_type.type
+        return (
+            isinstance(left_type, str)
+            and isinstance(right_type, str)
+            and REGEX_TYPE.match(left_type).group(0)
+            == REGEX_TYPE.match(right_type).group(0)
+        )
+
+    def _constant_row(self, row):
+        from . import ast as _ast
+
+        if isinstance(row, (_ast.Node, Select)):
+            self._check_subquery(row)
+            return row
+        if isinstance(row, RowValue):
+            if len(row.columns) != len(self.columns):
+                raise ValueError(
+                    "RowValue dimension mismatch: expected %d, got %d"
+                    % (len(self.columns), len(row.columns))
+                )
+            for left_column, right_column in zip(self.columns, row.columns):
+                if not self._types_match(left_column.type, right_column.type):
+                    raise TypeError(
+                        "RowValue type mismatch: expected %s, got %s"
+                        % (left_column.type, right_column.type)
+                    )
+            return row
+        self._check_row(row)
+        return tuple(row)
+
+    def __eq__(self, row):
+        return Query(
+            self.db,
+            self._dialect.row_eq,
+            self,
+            self._constant_row(row),
+        )
+
+    def __ne__(self, row):
+        return Query(
+            self.db,
+            self._dialect.row_ne,
+            self,
+            self._constant_row(row),
+        )
+
+    def __lt__(self, row):
+        return Query(
+            self.db,
+            self._dialect.row_lt,
+            self,
+            self._constant_row(row),
+        )
+
+    def __le__(self, row):
+        return Query(
+            self.db,
+            self._dialect.row_lte,
+            self,
+            self._constant_row(row),
+        )
+
+    def __gt__(self, row):
+        return Query(
+            self.db,
+            self._dialect.row_gt,
+            self,
+            self._constant_row(row),
+        )
+
+    def __ge__(self, row):
+        return Query(
+            self.db,
+            self._dialect.row_gte,
+            self,
+            self._constant_row(row),
+        )
+
+    def _normalize_rows(self, value):
+        from . import ast as _ast
+
+        if isinstance(value, (_ast.Node, Select)):
+            self._check_subquery(value)
+            return value
+        if isinstance(value, RowValue):
+            self._constant_row(value)
+            return value
+        if isinstance(value, (str, bytes)):
+            raise TypeError("RowValue.belongs requires rows or a subquery")
+        if not isinstance(value, (tuple, list)):
+            raise TypeError("RowValue.belongs requires rows or a subquery")
+        rows = list(value)
+        normalized_rows = []
+        for row in rows:
+            if not isinstance(row, (tuple, list, RowValue)):
+                raise ValueError("RowValue.belongs rows must be sequences")
+            if isinstance(row, RowValue):
+                self._constant_row(row)
+                normalized_rows.append(tuple(row.columns))
+            else:
+                self._check_row(row)
+                normalized_rows.append(tuple(row))
+        unique_rows = []
+        seen = set()
+        for row in normalized_rows:
+            key = tuple(id(column) for column in row) if any(
+                not isinstance(column, (str, int, float, bool, bytes, type(None)))
+                for column in row
+            ) else row
+            if key not in seen:
+                seen.add(key)
+                unique_rows.append(key)
+        return unique_rows
+
+    def belongs(self, *value):
+        if len(value) == 1:
+            value = value[0]
+        else:
+            value = list(value)
+        return Query(
+            self.db,
+            self._dialect.row_in,
+            self,
+            self._normalize_rows(value),
+        )
+
+    def not_belongs(self, *value):
+        if len(value) == 1:
+            value = value[0]
+        else:
+            value = list(value)
+        return Query(
+            self.db,
+            self._dialect.row_not_in,
+            self,
+            self._normalize_rows(value),
+        )
+
+
 class FieldVirtual(object):
     """
     Compute-on-read pseudo-field.

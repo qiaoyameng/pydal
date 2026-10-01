@@ -396,6 +396,7 @@ class MSSQLDialect(SQLDialect):
     true_exp = "1=1"
     false_exp = "1=0"
     dt_sep = "T"
+    supports_row_values = False
 
     @sqltype_for("boolean")
     def type_boolean(self):
@@ -972,4 +973,3 @@ class MSSQLRepresenter(SQLRepresenter, JSONRepresenter):
         # Argument order matches geometry: (value, srid). Previously
         # the args were swapped, producing invalid SQL.
         return "geography::STGeomFromText('%s',%s)" % (value, srid)
-

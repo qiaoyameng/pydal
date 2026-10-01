@@ -15,6 +15,8 @@ that responsibility into the compiler itself (or a dedicated Renderer).
 from __future__ import annotations
 
 import datetime as _datetime
+import re
+from dataclasses import replace
 from typing import Any, Callable, List, Optional, Tuple
 
 from .. import ast
@@ -120,6 +122,7 @@ class SQLCompiler:
     # Separator between date and time in a datetime literal — matches
     # ``SQLDialect.dt_sep``.
     dt_sep: str = " "
+    supports_row_values: bool = True
     # When True, compile_* entry points return ParamSQL with bound
     # parameters in place of inlined literals (for the types listed in
     # _PARAMETERIZABLE_TYPES). Default False to preserve byte-for-byte
@@ -562,10 +565,12 @@ class SQLCompiler:
         if (
             self._ctx is not None
             and n.value is not None
-            and isinstance(n.type, str)
+            and (isinstance(n.type, str) or hasattr(n.type, "type"))
             and (
-                n.type in _PARAMETERIZABLE_TYPES
-                or n.type.startswith(("decimal", "reference ", "big-reference "))
+                getattr(n.type, "type", n.type) in _PARAMETERIZABLE_TYPES
+                or str(getattr(n.type, "type", n.type)).startswith(
+                    ("decimal", "reference ", "big-reference ")
+                )
             )
         ):
             return self._ctx.bind(self._adapt_for_bind(n.value, n.type))
@@ -594,6 +599,8 @@ class SQLCompiler:
         * ``datetime`` -> ``"YYYY-MM-DD<sep>HH:MM:SS"``
         * everything else: passthrough (driver handles native types).
         """
+        if hasattr(type_, "type"):
+            return self._adapt_for_bind(value, type_.type)
         if type_ in ("string", "text", "password"):
             return to_unicode(value)
         if type_ in ("id", "big-id"):
@@ -628,6 +635,8 @@ class SQLCompiler:
             if isinstance(value, _datetime.date):
                 return value.isoformat()[:10] + self.dt_sep + "00:00:00"
             return str(value)
+        if isinstance(type_, str) and re.match(r"^(?:list:)?\w+", type_):
+            return value
         return value
 
     def v_Raw(self, n: ast.Raw) -> str:
@@ -706,6 +715,278 @@ class SQLCompiler:
         items = ",".join(self.visit(v) for v in n.values)
         return "(%s IN (%s))" % (self.visit(n.expr), items)
 
+    def v_RowValue(self, n: ast.RowValue) -> str:
+        return "(%s)" % ",".join(self.visit(expr) for expr in n.exprs)
+
+    def v_RowCompare(self, n: ast.RowCompare) -> str:
+        symbols = {
+            "eq": "=",
+            "ne": "<>",
+            "lt": "<",
+            "lte": "<=",
+            "gt": ">",
+            "gte": ">=",
+        }
+        if n.op not in symbols:
+            raise NotImplementedError("SQLCompiler: unknown row comparison %r" % n.op)
+        if self.supports_row_values:
+            return "(%s %s %s)" % (
+                self.visit(n.left),
+                symbols[n.op],
+                self.visit(n.right),
+            )
+        if isinstance(n.right, ast.Select):
+            return self._row_compare_subquery_fallback(n)
+        return self._row_compare_constant_fallback(n)
+
+    def v_RowInList(self, n: ast.RowInList) -> str:
+        if self.supports_row_values:
+            if not n.values:
+                return "(0=1)" if not n.negate else "(1=1)"
+            if len(n.values) == 1 and isinstance(n.values[0], ast.Select):
+                sub = self._compile_select_body(n.values[0])
+                if sub.endswith(";"):
+                    sub = sub[:-1]
+                return "(%s%s IN (%s))" % (
+                    self.visit(n.expr),
+                    " NOT" if n.negate else "",
+                    sub,
+                )
+            return "(%s%s IN (%s))" % (
+                self.visit(n.expr),
+                " NOT" if n.negate else "",
+                ",".join(self.visit(v) for v in n.values),
+            )
+        if not n.values:
+            predicate = ast.Raw("0=1")
+        elif len(n.values) == 1 and isinstance(n.values[0], ast.Select):
+            predicate = self._row_in_subquery_predicate(n.expr, n.values[0], False)
+        else:
+            predicate = self._row_in_constant_predicate(n.expr, n.values, False)
+        if n.negate:
+            return "(NOT %s)" % self.visit(predicate)
+        return "(%s)" % self.visit(predicate)
+
+    @staticmethod
+    def _row_columns(row: ast.Node) -> Tuple[ast.Node, ...]:
+        if not isinstance(row, ast.RowValue):
+            raise NotImplementedError("SQLCompiler: expected a row value")
+        return row.exprs
+
+    def _row_binary(self, op: str, left: ast.Node, right: ast.Node) -> ast.Node:
+        return ast.BinOp(op, left, right, opts=(("null_comparison", True),))
+
+    @staticmethod
+    def _row_and(left: ast.Node, right: ast.Node) -> ast.Node:
+        return ast.BinOp("and", left, right)
+
+    @staticmethod
+    def _row_or(left: ast.Node, right: ast.Node) -> ast.Node:
+        return ast.BinOp("or", left, right)
+
+    @staticmethod
+    def _row_is_null(value: ast.Node) -> ast.Node:
+        return ast.UnaryOp("is_null", value)
+
+    def _row_all(self, nodes, combinator):
+        if not nodes:
+            return ast.Raw("1=1")
+        result = nodes[0]
+        for node in nodes[1:]:
+            result = combinator(result, node)
+        return result
+
+    def _row_equality(self, lefts, rights):
+        return self._row_all(
+            [self._row_binary("eq", left, right) for left, right in zip(lefts, rights)],
+            self._row_and,
+        )
+
+    def _row_unknown(self, lefts, rights, right_is_constant=True):
+        terms = []
+        for left, right in zip(lefts, rights):
+            equal = self._row_binary("eq", left, right)
+            both_null = self._row_and(self._row_is_null(left), self._row_is_null(right))
+            terms.append(self._row_or(equal, both_null))
+        all_not_false = self._row_all(terms, self._row_and)
+        null_terms = [
+            self._row_or(self._row_is_null(left), self._row_is_null(right))
+            for left, right in zip(lefts, rights)
+            if (
+                not right_is_constant
+                or (isinstance(right, ast.Literal) and right.value is None)
+            )
+        ]
+        if not null_terms:
+            return None
+        any_unknown = self._row_all(null_terms, self._row_or)
+        return self._row_and(all_not_false, any_unknown)
+
+    def _row_lex_predicate(self, op, lefts, rights, include_equality=False):
+        terms = []
+        equality = []
+        for left, right in zip(lefts, rights):
+            prefix = self._row_all(equality, self._row_and)
+            terms.append(
+                self._row_and(prefix, self._row_binary(op, left, right))
+            )
+            equality.append(self._row_binary("eq", left, right))
+        if include_equality:
+            terms.append(self._row_all(equality, self._row_and))
+        return self._row_all(terms, self._row_or)
+
+    def _row_lex_unknown(self, op, lefts, rights):
+        terms = []
+        equality = []
+        for left, right in zip(lefts, rights):
+            prefix = self._row_all(equality, self._row_and)
+            comparison = self._row_binary(op, left, right)
+            terms.append(
+                self._row_and(prefix, self._row_is_null(comparison))
+            )
+            equality.append(self._row_binary("eq", left, right))
+        return self._row_all(terms, self._row_or)
+
+    def _row_compare_constant_fallback(self, n: ast.RowCompare) -> str:
+        lefts = self._row_columns(n.left)
+        rights = self._row_columns(n.right)
+        if n.op == "eq":
+            predicate = self._row_equality(lefts, rights)
+        elif n.op == "ne":
+            predicate = ast.UnaryOp("not", self._row_equality(lefts, rights))
+        else:
+            strict_op = "gt" if n.op in ("gt", "gte") else "lt"
+            lex_predicate = self._row_lex_predicate(
+                strict_op,
+                lefts,
+                rights,
+                include_equality=(
+                    n.op in ("lte", "gte")
+                    and not any(
+                        isinstance(node, ast.Literal) and node.value is None
+                        for node in rights
+                    )
+                ),
+            )
+            unknown_predicate = self._row_lex_unknown(
+                strict_op, lefts, rights
+            )
+            predicate = ast.FuncCall(
+                "case",
+                (
+                    lex_predicate,
+                    ast.Raw("1"),
+                    ast.Raw("0"),
+                    unknown_predicate,
+                ),
+            )
+        return "(%s)" % self.visit(predicate)
+
+    def _row_subquery_exists(self, subquery: ast.Select, condition: ast.Node) -> str:
+        where = subquery.where
+        if where is not None:
+            condition = self._row_and(condition, where)
+        compiled = self._compile_select_body(replace(subquery, where=condition))
+        if compiled.endswith(";"):
+            compiled = compiled[:-1]
+        return "EXISTS (%s)" % compiled
+
+    def _row_compare_subquery_fallback(self, n: ast.RowCompare) -> str:
+        lefts = self._row_columns(n.left)
+        rights = tuple(n.right.fields[: len(lefts)])
+        if n.op == "eq":
+            true_predicate = self._row_equality(lefts, rights)
+        elif n.op == "ne":
+            true_predicate = ast.UnaryOp(
+                "not", self._row_equality(lefts, rights)
+            )
+        else:
+            strict_op = "gt" if n.op in ("gt", "gte") else "lt"
+            lex_predicate = self._row_lex_predicate(
+                strict_op,
+                lefts,
+                rights,
+                include_equality=(
+                    n.op in ("lte", "gte")
+                    and not any(
+                        isinstance(node, ast.Literal) and node.value is None
+                        for node in rights
+                    )
+                ),
+            )
+            true_predicate = lex_predicate
+            unknown_lex_predicate = self._row_lex_unknown(
+                strict_op, lefts, rights
+            )
+        if n.op in ("lt", "lte", "gt", "gte"):
+            unknown_predicate = unknown_lex_predicate
+        else:
+            unknown_predicate = true_predicate
+        if n.right.where is not None:
+            exists = self._row_subquery_exists(n.right, n.right.where)
+        else:
+            exists = self._row_subquery_exists(n.right, ast.Raw("1=1"))
+        return "(CASE WHEN %s THEN %s ELSE NULL END)" % (
+            exists,
+            self.visit(
+                ast.FuncCall(
+                    "case",
+                    (
+                        ast.Raw(
+                            self._row_subquery_exists(n.right, true_predicate)
+                        ),
+                        ast.Raw("1"),
+                        ast.Raw("0"),
+                        ast.Raw(
+                            self._row_subquery_exists(
+                                n.right, self._row_is_null(unknown_predicate)
+                            )
+                        ),
+                    ),
+                )
+            ),
+        )
+
+    def _row_in_constant_predicate(self, left: ast.Node, rows, negate_unused=False):
+        del negate_unused
+        lefts = self._row_columns(left)
+        matched = []
+        unknown = []
+        for row in rows:
+            rights = self._row_columns(row)
+            equality = self._row_equality(lefts, rights)
+            matched.append(equality)
+            row_unknown = self._row_unknown(
+                lefts,
+                rights,
+                right_is_constant=not any(
+                    isinstance(node, ast.Node) and not isinstance(node, ast.Literal)
+                    for node in rights
+                ),
+            )
+            if row_unknown is not None:
+                unknown.append(row_unknown)
+        any_matched = self._row_all(matched, self._row_or)
+        if unknown:
+            any_unknown = self._row_all(unknown, self._row_or)
+            return self._row_or(
+                any_matched,
+                self._row_and(ast.UnaryOp("not", any_matched), any_unknown),
+            )
+        return any_matched
+
+    def _row_in_subquery_predicate(self, left: ast.Node, subquery: ast.Select, _):
+        lefts = self._row_columns(left)
+        rights = tuple(subquery.fields[: len(lefts)])
+        equality = self._row_equality(lefts, rights)
+        return ast.Raw(
+            "(CASE WHEN %s THEN 1 WHEN %s THEN NULL ELSE 0 END)"
+            % (
+                self._row_subquery_exists(subquery, equality),
+                self._row_subquery_exists(subquery, self._row_is_null(equality)),
+            )
+        )
+
     # ================================================================== ops
     # Comparisons, logical, arithmetic, ordering, null-predicates.
     # Each ``op_<name>`` / ``un_<name>`` is invoked by the visitor above
@@ -713,7 +994,14 @@ class SQLCompiler:
     # vocabulary so overriding for a backend is one-method-per-divergence.
     # =====================================================================
 
-    def _cmp(self, sym: str, l: ast.Node, r: ast.Node, null_form: Optional[str]) -> str:
+    def _cmp(
+        self,
+        sym: str,
+        l: ast.Node,
+        r: ast.Node,
+        null_form: Optional[str],
+        opts=None,
+    ) -> str:
         """
         Shared rendering for binary comparison ops.
 
@@ -722,34 +1010,36 @@ class SQLCompiler:
         if the op doesn't accept a None right (``<``, ``>``, ...).
         """
         if isinstance(r, ast.Literal) and r.value is None:
+            if opts and opts.get("null_comparison"):
+                return "(%s %s %s)" % (self.visit(l), sym, self.visit(r))
             if null_form is None:
                 raise RuntimeError("Cannot compare %s %s None" % (self.visit(l), sym))
             return "(%s %s)" % (self.visit(l), null_form)
         return "(%s %s %s)" % (self.visit(l), sym, self.visit(r))
 
-    def op_eq(self, l, r, _):
+    def op_eq(self, l, r, opts):
         """Render ``(left = right)`` — collapses to ``IS NULL`` for ``Literal(None)``."""
-        return self._cmp("=", l, r, "IS NULL")
+        return self._cmp("=", l, r, "IS NULL", opts)
 
-    def op_ne(self, l, r, _):
+    def op_ne(self, l, r, opts):
         """Render ``(left <> right)`` — collapses to ``IS NOT NULL`` for ``Literal(None)``."""
-        return self._cmp("<>", l, r, "IS NOT NULL")
+        return self._cmp("<>", l, r, "IS NOT NULL", opts)
 
-    def op_lt(self, l, r, _):
+    def op_lt(self, l, r, opts):
         """Render ``(left < right)``."""
-        return self._cmp("<", l, r, None)
+        return self._cmp("<", l, r, None, opts)
 
-    def op_lte(self, l, r, _):
+    def op_lte(self, l, r, opts):
         """Render ``(left <= right)``."""
-        return self._cmp("<=", l, r, None)
+        return self._cmp("<=", l, r, None, opts)
 
-    def op_gt(self, l, r, _):
+    def op_gt(self, l, r, opts):
         """Render ``(left > right)``."""
-        return self._cmp(">", l, r, None)
+        return self._cmp(">", l, r, None, opts)
 
-    def op_gte(self, l, r, _):
+    def op_gte(self, l, r, opts):
         """Render ``(left >= right)``."""
-        return self._cmp(">=", l, r, None)
+        return self._cmp(">=", l, r, None, opts)
 
     # Logical
 
@@ -1021,9 +1311,14 @@ class SQLCompiler:
 
     def fn_case(self, args, _):
         """Render ``CASE WHEN <query> THEN <true_val> ELSE <false_val> END``."""
-        return "CASE WHEN %s THEN %s ELSE %s END" % (
+        rendered = "CASE WHEN %s THEN %s" % (
             self.visit(args[0]),
             self._render_case_branch(args[1]),
+        )
+        if len(args) > 3:
+            rendered += " WHEN %s THEN NULL" % self.visit(args[3])
+        return "%s ELSE %s END" % (
+            rendered,
             self._render_case_branch(args[2]),
         )
 

@@ -22,7 +22,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from . import ast
 from .helpers.methods import merge_tablemaps, use_common_filters, xorify
-from .objects import DialectOp, Expression, Field, Query, Select, Table
+from .objects import DialectOp, Expression, Field, Query, RowValue, Select, Table
 
 
 # Op names that translate as straight BinOp(name, left, right) with no
@@ -94,7 +94,12 @@ def to_ast(value: Any, type_hint: Optional[str] = None) -> ast.Node:
         # ``field._rname``, honoring user rname= and table aliasing. We
         # bake it into the node so the compiler doesn't need to walk
         # back through pydal metadata to render the column reference.
-        return ast.FieldRef(value._tablename, value.name, sqlsafe=value.sqlsafe)
+        return ast.FieldRef(
+            value._tablename,
+            value.name,
+            sqlsafe=value.sqlsafe,
+            type=getattr(value, "type", None),
+        )
     if isinstance(value, Select):
         return _select_to_ast(value)
     if isinstance(value, (Expression, Query)):
@@ -124,8 +129,17 @@ def _select_to_ast(sel: Select) -> ast.Node:
 
 def _field_type(node: Any) -> Optional[str]:
     """Best-effort field-type hint for a left operand."""
+    if isinstance(node, ast.FieldRef):
+        return node.type
     t = getattr(node, "type", None)
     return t if isinstance(t, str) else None
+
+
+def _row_value(values: Sequence[Any], types: Sequence[Optional[str]]) -> ast.RowValue:
+    return ast.RowValue(
+        tuple(to_ast(value, type_hint=ftype) for value, ftype in zip(values, types)),
+        tuple(types),
+    )
 
 
 def _expr_to_ast(expr) -> ast.Node:
@@ -192,6 +206,33 @@ def _expr_to_ast(expr) -> ast.Node:
         if "case_sensitive" in oa:
             opts2 += (("case_sensitive", oa["case_sensitive"]),)
         return ast.BinOp("contains", to_ast(f), to_ast(s), opts=opts2)
+
+    # ---------- row values ----------
+    if name == "row_value":
+        return _row_value(f, tuple(getattr(column, "type", None) for column in f))
+
+    if name in {"row_eq", "row_ne", "row_lt", "row_lte", "row_gt", "row_gte"}:
+        op_name = name[4:]
+        if isinstance(s, ast.Node):
+            right = to_ast(s)
+        elif isinstance(s, RowValue):
+            right = to_ast(s)
+        elif isinstance(s, Select):
+            right = to_ast(s)
+        else:
+            right = _row_value(s, f.types)
+        return ast.RowCompare(op_name, to_ast(f), right)
+
+    if name in {"row_in", "row_not_in"}:
+        if isinstance(s, RowValue):
+            values = (to_ast(s),)
+        elif isinstance(s, ast.Node):
+            values = (to_ast(s),)
+        elif isinstance(s, Select):
+            values = (to_ast(s),)
+        else:
+            values = tuple(_row_value(row, f.types) for row in s)
+        return ast.RowInList(to_ast(f), values, negate=name == "row_not_in")
 
     # ---------- belongs / IN ----------
     if name == "belongs":

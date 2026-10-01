@@ -62,6 +62,7 @@ class FieldRef(Node):
     table: str
     name: str
     sqlsafe: Optional[str] = None
+    type: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,33 @@ class InList(Node):
 
     expr: Node
     values: Tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class RowValue(Node):
+    """A parenthesised, ordered list of row value expressions."""
+
+    exprs: Tuple[Node, ...]
+    types: Tuple[Optional[str], ...] = ()
+
+
+@dataclass(frozen=True)
+class RowCompare(Node):
+    """A comparison between two row values of equal arity."""
+
+    op: str
+    left: Node
+    right: Node
+    opts: Opts = ()
+
+
+@dataclass(frozen=True)
+class RowInList(Node):
+    """A row-value IN / NOT IN predicate."""
+
+    expr: Node
+    values: Tuple[Node, ...]
+    negate: bool = False
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,7 @@ from .ast_joins import *
 from .ast_params import *
 from .ast_statements import *
 from .ast_subselect import *
+from .ast_row_values import *
 from .ast_translate import *
 from .connection import *
 from .cross_dialect import *

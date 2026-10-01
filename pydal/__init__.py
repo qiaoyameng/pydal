@@ -18,7 +18,7 @@ __version__ = "1.20260520.0"
 from .base import DAL
 from .helpers.classes import SQLCustomType
 from .helpers.methods import geoLine, geoPoint, geoPolygon
-from .objects import Field
+from .objects import Field, RowValue
 from .querybuilder import QueryBuilder, QueryParseError
 
 __all__ = [
@@ -27,6 +27,7 @@ __all__ = [
     "SQLCustomType",
     "QueryBuilder",
     "QueryParseError",
+    "RowValue",
     "geoLine",
     "geoPoint",
     "geoPolygon",

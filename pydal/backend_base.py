@@ -63,6 +63,7 @@ from .objects import (
     Query,
     Rows,
     Row,
+    RowValue,
     Select,
     Table,
     VirtualCommand,
@@ -785,6 +786,8 @@ class BaseAdapter(ConnectionPool, metaclass=AdapterMeta):
                 if tables.get(key, query.table) is not query.table:
                     raise ValueError("Name conflict in table list: %s" % key)
                 tables[key] = query.table
+            elif isinstance(query, (list, tuple)):
+                tables = merge_tablemaps(tables, self.tables(*query))
             elif isinstance(query, (Expression, Query)):
                 tmp = [x for x in (query.first, query.second) if x is not None]
                 tables = merge_tablemaps(tables, self.tables(*tmp))
@@ -1937,6 +1940,7 @@ class SQLDialect(CommonDialect):
     true_exp = "1"
     false_exp = "0"
     dt_sep = " "
+    supports_row_values = True
 
     @sqltype_for("string")
     def type_string(self):
@@ -2195,6 +2199,187 @@ class SQLDialect(CommonDialect):
             self.expand(item, ftype, query_env=query_env) for item in second
         )
         return "(%s IN (%s))" % (first, items)
+
+    def row_value(self, first, query_env={}):
+        return "(%s)" % ",".join(
+            self.expand(column, query_env=query_env) for column in first
+        )
+
+    def _row_render(self, first, second, query_env={}):
+        if isinstance(second, RowValue):
+            return self.row_value(second.columns, query_env=query_env)
+        return "(%s)" % ",".join(
+            self.expand(value, column.type, query_env=query_env)
+            for column, value in zip(first.columns, second)
+        )
+
+    def _row_scalar(self, column, op, value, query_env={}):
+        left = self.expand(column, query_env=query_env)
+        right = self.expand(value, column.type, query_env=query_env)
+        return "(%s %s %s)" % (left, op, right)
+
+    @staticmethod
+    def _join(items, separator):
+        if not items:
+            return None
+        expression = items[0]
+        for item in items[1:]:
+            expression = "(%s %s %s)" % (expression, separator, item)
+        return expression
+
+    def _row_equality(self, columns, values, query_env={}):
+        return self._join(
+            [
+                self._row_scalar(column, "=", value, query_env)
+                for column, value in zip(columns, values)
+            ],
+            "AND",
+        )
+
+    def _row_unknown(self, columns, values, query_env={}, right_is_constant=True):
+        not_false = []
+        null_checks = []
+        for column, value in zip(columns, values):
+            rendered_left = self.expand(column, query_env=query_env)
+            rendered_right = self.expand(value, column.type, query_env=query_env)
+            eq = self._row_scalar(column, "=", value, query_env)
+            not_false.append(
+                "(%s OR %s IS NULL)"
+                % (eq, rendered_left)
+            )
+            if not right_is_constant or value is None:
+                null_checks.append(
+                    "(%s IS NULL OR %s IS NULL)"
+                    % (rendered_left, rendered_right)
+                )
+        all_not_false = self._join(not_false, "AND")
+        any_null = self._join(null_checks, "OR")
+        if not null_checks:
+            return None
+        return "(%s AND %s)" % (all_not_false, any_null)
+
+    def _row_compare_fallback(self, op, first, second, query_env={}):
+        columns = first.columns
+        right_is_constant = not isinstance(second, RowValue)
+        strict_op = ">" if op in (">", ">=") else ("<" if op in ("<", "<=") else op)
+        equality = []
+        alternatives = []
+        unknown_alternatives = []
+        for column, value in zip(columns, second):
+            prefix = self._join(equality, "AND")
+            comparison = self._row_scalar(column, strict_op, value, query_env)
+            if prefix is None:
+                alternatives.append(comparison)
+                unknown_alternatives.append("%s IS NULL" % comparison)
+            else:
+                alternatives.append("(%s AND %s)" % (prefix, comparison))
+                unknown_alternatives.append(
+                    "(%s AND %s IS NULL)" % (prefix, comparison)
+                )
+            equality.append(self._row_scalar(column, "=", value, query_env))
+        if op in ("<=", ">=") and (
+            not right_is_constant or all(value is not None for value in second)
+        ):
+            alternatives.append(self._join(equality, "AND"))
+        lex_true = self._join(alternatives, "OR")
+        lex_unknown = self._join(unknown_alternatives, "OR")
+        if op in ("<", "<=", ">", ">="):
+            return "(CASE WHEN %s THEN 1 WHEN %s THEN NULL ELSE 0 END)" % (
+                lex_true,
+                lex_unknown,
+            )
+        return lex_true
+
+    def _row_compare_native(self, op, first, second, query_env={}):
+        return "(%s %s %s)" % (
+            self.row_value(first.columns, query_env=query_env),
+            op,
+            self._row_render(first, second, query_env=query_env),
+        )
+
+    def _row_compare(self, op, first, second, query_env={}):
+        if self.supports_row_values:
+            return self._row_compare_native(op, first, second, query_env)
+        if isinstance(second, Select):
+            raise NotImplementedError("Subquery row comparison requires row values")
+        if isinstance(second, RowValue):
+            second = second.columns
+        return self._row_compare_fallback(op, first, second, query_env)
+
+    def row_eq(self, first, second=None, query_env={}):
+        if self.supports_row_values:
+            return self._row_compare_native("=", first, second, query_env)
+        if isinstance(second, RowValue):
+            second = second.columns
+        return self._row_equality(first.columns, second, query_env)
+
+    def row_ne(self, first, second=None, query_env={}):
+        if self.supports_row_values:
+            return self._row_compare_native("<>", first, second, query_env)
+        if isinstance(second, RowValue):
+            second = second.columns
+        return "(NOT %s)" % self._row_equality(first.columns, second, query_env)
+
+    def row_lt(self, first, second=None, query_env={}):
+        return self._row_compare("<", first, second, query_env)
+
+    def row_lte(self, first, second=None, query_env={}):
+        return self._row_compare("<=", first, second, query_env)
+
+    def row_gt(self, first, second=None, query_env={}):
+        return self._row_compare(">", first, second, query_env)
+
+    def row_gte(self, first, second=None, query_env={}):
+        return self._row_compare(">=", first, second, query_env)
+
+    def _row_in_constant(self, first, second, negate, query_env):
+        if not second:
+            return "(0=1)" if not negate else "(1=1)"
+        matched = []
+        unknown = []
+        for row in second:
+            matched.append(self._row_equality(first.columns, row, query_env))
+            row_unknown = self._row_unknown(first.columns, row, query_env)
+            if row_unknown is not None:
+                unknown.append(row_unknown)
+        any_matched = self._join(matched, "OR")
+        if unknown:
+            any_unknown = self._join(unknown, "OR")
+            predicate = (
+                "(%s OR ((NOT %s) AND %s))"
+                % (any_matched, any_matched, any_unknown)
+            )
+        else:
+            predicate = any_matched
+        if negate:
+            return "(NOT %s)" % predicate
+        return predicate
+
+    def _row_in_native(self, first, second, negate, query_env):
+        left = self.row_value(first.columns, query_env=query_env)
+        if isinstance(second, Select):
+            if len(second._qfields) != len(first.columns):
+                raise ValueError("Subquery in row IN must match row dimensions")
+            right = second._compile(query_env.get("current_scope", []))[1][:-1]
+        else:
+            if not second:
+                return "(0=1)" if not negate else "(1=1)"
+            rows = [
+                self._row_render(first, row, query_env=query_env)
+                for row in second
+            ]
+            right = ",".join(rows)
+        return "(%s%s IN (%s))" % (left, " NOT" if negate else "", right)
+
+    def row_in(self, first, second=None, query_env={}):
+        if self.supports_row_values:
+            return self._row_in_native(first, second, False, query_env)
+        return self._row_in_constant(first, second, False, query_env)
+
+    def row_not_in(self, first, second=None, query_env={}):
+        if self.supports_row_values:
+            return self._row_in_native(first, second, True, query_env)
+        return self._row_in_constant(first, second, True, query_env)
 
     # def regexp(self, first, second):
     #     raise NotImplementedError
