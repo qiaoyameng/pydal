@@ -820,6 +820,50 @@ class DAL(Serializable, BasicStorage, metaclass=MetaDAL):
                 del THREAD_LOCAL._pydal_db_instances_[self._db_uid]
         self._adapter._clean_tlocals()
 
+    def register_sqlite_aggregate(
+        self, name, num_args, aggregate, replace=False
+    ):
+        """
+        Register a SQLite aggregate for every connection opened by this DAL.
+
+        ``aggregate`` is a class or zero-argument factory following the Python
+        ``sqlite3`` protocol. Each invocation receives a fresh instance;
+        ``step()`` is called for every input row and ``finalize()`` returns
+        the result.
+        Replacing or removing a registration does not interrupt a statement
+        that is already executing; statements prepared afterwards use the
+        new registration.
+        """
+        self._adapter.register_sqlite_aggregate(
+            name, num_args, aggregate, replace=replace
+        )
+
+    def register_sqlite_window_function(
+        self, name, num_args, aggregate, replace=False
+    ):
+        """
+        Register a SQLite window aggregate for every connection opened by this DAL.
+
+        ``aggregate`` is a class or zero-argument factory returning a fresh
+        state object with ``step()``, ``inverse()``, ``value()`` and
+        ``finalize()``. A failure raised during registration means the
+        installed SQLite driver/library cannot register window functions.
+        Replacing or removing a registration does not interrupt statements
+        that are already executing; statements prepared afterwards use the
+        updated registration.
+        """
+        self._adapter.register_sqlite_window_function(
+            name, num_args, aggregate, replace=replace
+        )
+
+    def unregister_sqlite_aggregate(self, name, num_args):
+        """Remove a SQLite aggregate from this DAL's connections."""
+        self._adapter.unregister_sqlite_aggregate(name, num_args)
+
+    def unregister_sqlite_window_function(self, name, num_args):
+        """Remove a SQLite window aggregate from this DAL's connections."""
+        self._adapter.unregister_sqlite_window_function(name, num_args)
+
     def get_connection_from_pool_or_new(self):
         self._adapter.reconnect()
 

@@ -31,3 +31,12 @@ class NotOnNOSQLError(NotImplementedError):
         if message is None:
             message = "Not supported on NoSQL databases"
         super().__init__(message)
+
+
+class NotOnSQLiteError(NotImplementedError):
+    """A SQLite-specific feature was invoked against another backend."""
+
+    def __init__(self, message: Optional[str] = None):
+        if message is None:
+            message = "Supported on SQLite databases only"
+        super().__init__(message)

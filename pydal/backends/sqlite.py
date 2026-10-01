@@ -6,6 +6,7 @@
 
 import platform
 import re
+import threading
 import uuid
 from datetime import date, datetime
 from os.path import join as pjoin
@@ -13,6 +14,7 @@ from time import mktime
 
 from ..backend_base import adapters
 from ..backend_base import SQLAdapter
+from .._globals import THREAD_LOCAL
 
 
 def convert_date(val):
@@ -43,6 +45,8 @@ class SQLite(SQLAdapter):
 
     def _initialize_(self):
         self.pool_size = 0
+        self._sqlite_functions = {}
+        self._sqlite_functions_lock = threading.RLock()
         super(SQLite, self)._initialize_()
         if ":memory" in self.uri.split("://", 1)[0]:
             self.dbpath = "file:%s?mode=memory&cache=shared" % uuid.uuid4()
@@ -98,9 +102,163 @@ class SQLite(SQLAdapter):
     def _register_regexp(self):
         self.connection.create_function("REGEXP", 2, self.web2py_regexp)
 
+    @staticmethod
+    def _sqlite_function_key(name, num_args, kind):
+        if not isinstance(name, str) or not name:
+            raise ValueError("SQLite function name must be a non-empty string")
+        if (
+            not isinstance(num_args, int)
+            or isinstance(num_args, bool)
+            or num_args < -1
+        ):
+            raise ValueError("SQLite function argument count must be an integer >= -1")
+        if kind not in ("aggregate", "window"):
+            raise ValueError("Unsupported SQLite function kind: %s" % kind)
+        return (name.casefold(), num_args, kind)
+
+    @staticmethod
+    def _validate_sqlite_aggregate(aggregate, kind):
+        required_methods = ("step", "finalize")
+        if kind == "window":
+            required_methods += ("inverse", "value")
+        if not callable(aggregate):
+            raise TypeError("SQLite %s factory must be callable" % kind)
+        if isinstance(aggregate, type):
+            for method_name in required_methods:
+                if not callable(getattr(aggregate, method_name, None)):
+                    raise TypeError(
+                        "SQLite %s class must define a callable %s() method"
+                        % (kind, method_name)
+                    )
+
+    def _sqlite_window_supported(self):
+        create_window_function = getattr(
+            self.driver.Connection, "create_window_function", None
+        )
+        if not callable(create_window_function):
+            return False
+        version_info = getattr(self.driver, "sqlite_version_info", None)
+        if version_info is not None:
+            return version_info >= (3, 25, 0)
+
+        probe = None
+        try:
+            probe = self.driver.Connection(":memory:")
+
+            class WindowSupportProbe:
+                def step(self):
+                    pass
+
+                def inverse(self):
+                    pass
+
+                def value(self):
+                    return None
+
+                def finalize(self):
+                    pass
+
+            probe.create_window_function(
+                "_pydal_window_support", 0, WindowSupportProbe
+            )
+        except Exception:
+            return False
+        else:
+            return True
+        finally:
+            if probe is not None:
+                probe.close()
+
+    def _install_sqlite_function(
+        self, connection, name, num_args, kind, aggregate
+    ):
+        if kind == "aggregate":
+            connection.create_aggregate(name, num_args, aggregate)
+        else:
+            connection.create_window_function(name, num_args, aggregate)
+
+    def _install_sqlite_functions(self, connection=None):
+        connection = connection or self.connection
+        with self._sqlite_functions_lock:
+            registrations = [
+                (name, key[1], key[2], aggregate)
+                for key, (name, aggregate) in self._sqlite_functions.items()
+            ]
+        for name, num_args, kind, aggregate in registrations:
+            self._install_sqlite_function(
+                connection, name, num_args, kind, aggregate
+            )
+
+    def _register_sqlite_function(
+        self, name, num_args, aggregate, kind, replace=False
+    ):
+        self._validate_sqlite_aggregate(aggregate, kind)
+        key = self._sqlite_function_key(name, num_args, kind)
+        if kind == "window" and not self._sqlite_window_supported():
+            exception_class = getattr(
+                self.driver, "NotSupportedError", NotImplementedError
+            )
+            raise exception_class(
+                "SQLite connection does not support window function registration"
+            )
+
+        with self._sqlite_functions_lock:
+            existing = self._sqlite_functions.get(key)
+            if existing is not None and existing != (
+                name,
+                aggregate,
+            ) and not replace:
+                raise ValueError(
+                    "SQLite %s function %r with %d argument(s) is already "
+                    "registered; "
+                    "use replace=True to replace it" % (kind, name, num_args)
+                )
+
+            connection = getattr(THREAD_LOCAL, self._connection_uname_, None)
+            if connection is not None:
+                self._install_sqlite_function(
+                    connection, name, num_args, kind, aggregate
+                )
+            self._sqlite_functions[key] = (name, aggregate)
+
+    def _unregister_sqlite_function(self, name, num_args, kind):
+        key = self._sqlite_function_key(name, num_args, kind)
+        with self._sqlite_functions_lock:
+            if key not in self._sqlite_functions:
+                raise KeyError(
+                    "SQLite %s function %r with %d argument(s) is not registered"
+                    % (kind, name, num_args)
+                )
+
+            connection = getattr(THREAD_LOCAL, self._connection_uname_, None)
+            if connection is not None:
+                self._install_sqlite_function(connection, name, num_args, kind, None)
+            del self._sqlite_functions[key]
+
+    def register_sqlite_aggregate(
+        self, name, num_args, aggregate, replace=False
+    ):
+        """Register/replace a per-connection SQLite aggregate on this DAL."""
+        self._register_sqlite_function(name, num_args, aggregate, "aggregate", replace)
+
+    def register_sqlite_window_function(
+        self, name, num_args, aggregate, replace=False
+    ):
+        """Register/replace a per-connection SQLite window aggregate on this DAL."""
+        self._register_sqlite_function(name, num_args, aggregate, "window", replace)
+
+    def unregister_sqlite_aggregate(self, name, num_args):
+        """Remove a SQLite aggregate from future statements and connections."""
+        self._unregister_sqlite_function(name, num_args, "aggregate")
+
+    def unregister_sqlite_window_function(self, name, num_args):
+        """Remove a SQLite window aggregate from future statements."""
+        self._unregister_sqlite_function(name, num_args, "window")
+
     def after_connection(self):
         self._register_extract()
         self._register_regexp()
+        self._install_sqlite_functions()
         if self.adapter_args.get("foreign_keys", True):
             self.execute("PRAGMA foreign_keys=ON;")
 
@@ -161,6 +319,7 @@ class JDBCSQLite(SQLite):
 
     def after_connection(self):
         self._register_extract()
+        self._install_sqlite_functions()
 
 # ============================================================
 # Dialect
@@ -400,4 +559,3 @@ class SpatialiteRepresenter(SQLRepresenter):
     def _geometry(self, value, srid):
         """Render WKT geometry via ``ST_GeomFromText('<wkt>', srid)``."""
         return "ST_GeomFromText('%s',%s)" % (value, srid)
-

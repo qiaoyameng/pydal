@@ -34,7 +34,7 @@ from decimal import Decimal
 
 from ._globals import IDENTITY
 from .connection import ConnectionPool
-from .exceptions import NotOnNOSQLError
+from .exceptions import NotOnNOSQLError, NotOnSQLiteError
 from .helpers._internals import Dispatcher
 from .helpers.classes import (
     SQLALL,
@@ -767,6 +767,18 @@ class BaseAdapter(ConnectionPool, metaclass=AdapterMeta):
 
     def connector(self):
         return self.driver.connect(self.driver_args)
+
+    def register_sqlite_aggregate(self, *args, **kwargs):
+        raise NotOnSQLiteError("SQLite aggregate registration requires SQLite")
+
+    def register_sqlite_window_function(self, *args, **kwargs):
+        raise NotOnSQLiteError("SQLite window function registration requires SQLite")
+
+    def unregister_sqlite_aggregate(self, *args, **kwargs):
+        raise NotOnSQLiteError("SQLite aggregate unregistration requires SQLite")
+
+    def unregister_sqlite_window_function(self, *args, **kwargs):
+        raise NotOnSQLiteError("SQLite window function unregistration requires SQLite")
 
     def test_connection(self):
         pass
