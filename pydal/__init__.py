@@ -8,6 +8,7 @@ Public API exposed at the package root:
 * ``SQLCustomType`` — descriptor for backend-specific column types.
 * ``QueryBuilder`` — natural-language → ``Query`` parser.
 * ``QueryParseError`` — raised by ``QueryBuilder`` on parse failure.
+* ``QueryBuilderConfigurationError`` — raised for ambiguous aliases.
 * ``geoPoint`` / ``geoLine`` / ``geoPolygon`` — WKT geometry helpers.
 
 See ``README.md`` for the full API tour.
@@ -19,13 +20,18 @@ from .base import DAL
 from .helpers.classes import SQLCustomType
 from .helpers.methods import geoLine, geoPoint, geoPolygon
 from .objects import Field
-from .querybuilder import QueryBuilder, QueryParseError
+from .querybuilder import (
+    QueryBuilder,
+    QueryBuilderConfigurationError,
+    QueryParseError,
+)
 
 __all__ = [
     "DAL",
     "Field",
     "SQLCustomType",
     "QueryBuilder",
+    "QueryBuilderConfigurationError",
     "QueryParseError",
     "geoLine",
     "geoPoint",

@@ -829,6 +829,19 @@ Recognized tokens: `not`, `and`, `or`, `==`, `!=`, `<`, `>`, `<=`,
 `contains`, `starts with`, `belongs`, `upper`, `lower`. Custom
 aliases let you localize the vocabulary or rename fields.
 
+For explicit boolean precedence (`NOT` > `AND` > `OR`, with parentheses
+overriding precedence), opt in without changing existing callers:
+
+```python
+builder = QueryBuilder(db.thing, mode="standard", max_depth=32)
+q = builder.parse('name == "Chair" or name == "Table" and active is true')
+```
+
+Standard-mode syntax errors carry the original input and a half-open
+character range as `error.text` and `error.span`. Alias collisions with
+reserved logical words raise `QueryBuilderConfigurationError` when the
+builder is configured.
+
 ---
 
 ## Optional tools
