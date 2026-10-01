@@ -45,7 +45,12 @@ from os.path import exists, join as pjoin
 
 from ._globals import AND, DEFAULT, IDENTITY, OR
 from .utils import hashlib_md5, to_bytes, to_native, to_unicode
-from .exceptions import NotAuthorizedException, NotFoundException
+from .exceptions import (
+    AssemblyConflict,
+    AssemblyError,
+    NotAuthorizedException,
+    NotFoundException,
+)
 from .helpers.classes import (
     SQLALL,
     BasicStorage,
@@ -3685,6 +3690,124 @@ class BasicRows(object):
     json = as_json
 
 
+def _assembly_spec(alias, identity="id", name=None, many=False, relations=None):
+    """
+    Normalizes one node of an assembly specification for `Rows.assemble`.
+    """
+    if not alias:
+        raise AssemblyError("assembly nodes require a source alias")
+    if isinstance(identity, str):
+        identity = (identity,)
+    identity = tuple(identity)
+    if not identity:
+        raise AssemblyError(
+            "assembly node %r requires at least one identity field" % alias
+        )
+    normalized = []
+    for relation in relations or []:
+        relation = dict(relation)
+        rel_name = relation.get("name")
+        if not rel_name:
+            raise AssemblyError("assembly relations require a 'name'")
+        normalized.append(
+            _assembly_spec(
+                alias=relation.get("alias", rel_name),
+                identity=relation.get("identity", "id"),
+                name=rel_name,
+                many=bool(relation.get("many", False)),
+                relations=relation.get("relations"),
+            )
+        )
+    return {
+        "alias": alias,
+        "identity": identity,
+        "name": name,
+        "many": many,
+        "relations": normalized,
+    }
+
+
+class _RowsAssembler(object):
+    """
+    Single-pass helper behind `Rows.assemble`. Every identity map lives in
+    this instance, so nothing is shared (or cached) across assemblies.
+    """
+
+    def __init__(self, columns):
+        # columns: {alias: [field, ...]} taken from Rows.colnames
+        self.columns = columns
+        # (id(parent node), relation name) -> {identity key: child node}
+        self._children = {}
+
+    def run(self, records, spec):
+        roots = []
+        root_map = {}
+        for record in records:
+            node, is_new = self._node_for(record, spec, root_map)
+            if is_new:
+                roots.append(node)
+        return roots
+
+    def _node_for(self, record, spec, identity_map):
+        alias = spec["alias"]
+        if alias not in self.columns:
+            raise AssemblyError(
+                "alias %r was not selected; cannot assemble it" % alias
+            )
+        data = record.get(alias)
+        if data is None:
+            raise AssemblyError(
+                "alias %r is not present in the selected rows" % alias
+            )
+        key = tuple(data.get(field) for field in spec["identity"])
+        if all(value is None for value in key):
+            # left join produced no row for this alias
+            return None, False
+        node = identity_map.get(key)
+        if node is None:
+            node = Row()
+            for field in self.columns[alias]:
+                node[field] = data.get(field)
+            for relation in spec["relations"]:
+                node[relation["name"]] = [] if relation["many"] else None
+            identity_map[key] = node
+            is_new = True
+        else:
+            self._merge_scalars(node, data, spec, key)
+            is_new = False
+        for relation in spec["relations"]:
+            self._assemble_relation(record, node, relation)
+        return node, is_new
+
+    def _merge_scalars(self, node, data, spec, key):
+        alias = spec["alias"]
+        for field in self.columns[alias]:
+            value = data.get(field)
+            if node[field] != value:
+                raise AssemblyConflict(
+                    "conflicting values for field %r of alias %r on identity "
+                    "%r: %r != %r" % (field, alias, key, node[field], value)
+                )
+
+    def _assemble_relation(self, record, parent, spec):
+        relation_map = self._children.setdefault((id(parent), spec["name"]), {})
+        child, is_new = self._node_for(record, spec, relation_map)
+        if child is None:
+            return
+        if spec["many"]:
+            if is_new:
+                parent[spec["name"]].append(child)
+        else:
+            existing = parent[spec["name"]]
+            if existing is None:
+                parent[spec["name"]] = child
+            elif existing is not child:
+                raise AssemblyError(
+                    "one-to-one relation %r of alias %r maps a second identity "
+                    "to the same parent" % (spec["name"], spec["alias"])
+                )
+
+
 class Rows(BasicRows):
     """
     A wrapper for the return value of a select. It basically represents a table.
@@ -3982,6 +4105,55 @@ class Rows(BasicRows):
             for row in self:
                 row[name] = maps.get(row.id, [])
         return self
+
+    def assemble(self, root, identity="id", relations=None):
+        """
+        Folds a flat join product into a graph of `Row` nodes. This is an
+        explicit, opt-in alternative to iterating the (duplicated) product
+        rows: the caller declares the root alias, each relation's source
+        alias and identity field(s), and whether the relation is
+        one-to-many or one-to-one.
+
+        For example::
+
+            rows = db(db.orders.id == db.order_items.order_id).select(
+                db.orders.ALL, db.order_items.ALL, db.order_tags.ALL,
+                left=db.order_tags.on(db.order_tags.order_id == db.orders.id))
+            graph = rows.assemble(
+                "orders", identity="id",
+                relations=[
+                    {"name": "items", "alias": "order_items",
+                     "identity": "id", "many": True},
+                    {"name": "tags", "alias": "order_tags",
+                     "identity": "id", "many": True},
+                ])
+
+        returns a list of root `Row` objects (one per distinct root
+        identity, in first-seen order). Each node carries the scalar
+        columns of its alias plus one attribute per relation: a list of
+        child nodes for ``many=True``, a single child node or `None`
+        otherwise. Relations accept a nested ``relations`` list for
+        deeper graphs, and ``identity`` may name several fields for
+        composite keys. Self-joins work by selecting an aliased table
+        and declaring that alias.
+
+        Rows whose identity fields are all `None` (a left join with no
+        matching child) contribute no node. If two product rows disagree
+        on a scalar value for the same node identity, an
+        `AssemblyConflict` is raised instead of silently keeping the
+        last value; if a one-to-one relation maps two different
+        identities to the same parent, an `AssemblyError` is raised.
+        Identity maps are local to this call: nothing is cached on the
+        `Rows` object, and plain iteration/join behavior is unchanged.
+        """
+        spec = _assembly_spec(root, identity=identity, relations=relations)
+        columns = {}
+        for colname in self.colnames:
+            alias, dot, field = colname.partition(".")
+            if dot:
+                columns.setdefault(alias, []).append(field)
+        assembler = _RowsAssembler(columns)
+        return assembler.run(self.records, spec)
 
     def group_by_value(self, *fields, **args):
         """

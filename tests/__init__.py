@@ -7,6 +7,7 @@ if IS_NOSQL:
 else:
     from .sql import *
     from .indexes import *
+    from .rows_assemble import *
 
 # Backend-agnostic suites.
 from .ast_advanced import *

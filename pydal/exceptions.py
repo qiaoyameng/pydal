@@ -31,3 +31,11 @@ class NotOnNOSQLError(NotImplementedError):
         if message is None:
             message = "Not supported on NoSQL databases"
         super().__init__(message)
+
+
+class AssemblyError(Exception):
+    """A graph assembly specification could not be applied to the rows."""
+
+
+class AssemblyConflict(AssemblyError):
+    """Two product rows disagree on a scalar value for the same node identity."""
