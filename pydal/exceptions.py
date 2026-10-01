@@ -31,3 +31,7 @@ class NotOnNOSQLError(NotImplementedError):
         if message is None:
             message = "Not supported on NoSQL databases"
         super().__init__(message)
+
+
+class GraphAssemblyError(ValueError):
+    """An explicitly declared graph cannot be assembled."""

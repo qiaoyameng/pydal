@@ -15,6 +15,7 @@ from pydal import DAL, Field
 from io import BytesIO, StringIO
 from pydal.utils import to_bytes
 from pydal.helpers.classes import SQLALL, OpRow
+from pydal.exceptions import GraphAssemblyError
 from pydal.objects import Expression, Row, Table
 
 from ._adapt import (
@@ -1694,6 +1695,304 @@ class TestJoin(DALtest):
         self.assertEqual(row["person.name"], "max")
         db.dog.drop()
         self.assertEqual(len(db.person._referenced_by), 0)
+
+
+class TestRowsAssembleGraph(unittest.TestCase):
+    def test_folds_order_lines_and_tags(self):
+        db = DAL("sqlite:memory")
+        db.define_table("graph_order", Field("name"))
+        db.define_table(
+            "graph_line", Field("graph_order", db.graph_order), Field("name")
+        )
+        db.define_table(
+            "graph_tag", Field("graph_order", db.graph_order), Field("name")
+        )
+        first_id = db.graph_order.insert(name="first")
+        empty_id = db.graph_order.insert(name="empty")
+        first_line = db.graph_line.insert(graph_order=first_id, name="line-1")
+        second_line = db.graph_line.insert(graph_order=first_id, name="line-2")
+        first_tag = db.graph_tag.insert(graph_order=first_id, name="tag-a")
+        second_tag = db.graph_tag.insert(graph_order=first_id, name="tag-b")
+
+        rows = db().select(
+            db.graph_order.ALL,
+            db.graph_line.ALL,
+            db.graph_tag.ALL,
+            left=[
+                db.graph_line.on(
+                    db.graph_order.id == db.graph_line.graph_order
+                ),
+                db.graph_tag.on(db.graph_order.id == db.graph_tag.graph_order),
+            ],
+            orderby=db.graph_order.id
+            | db.graph_line.id
+            | db.graph_tag.id,
+        )
+
+        self.assertEqual(len(rows), 5)
+
+        graph = rows.assemble_graph(
+            "graph_order",
+            [
+                {
+                    "name": "lines",
+                    "parent": "graph_order",
+                    "child": "graph_line",
+                    "parent_fields": ("id",),
+                    "child_fields": ("graph_order",),
+                    "identity_fields": ("id",),
+                    "cardinality": "many",
+                },
+                {
+                    "name": "tags",
+                    "parent": "graph_order",
+                    "child": "graph_tag",
+                    "parent_fields": ("id",),
+                    "child_fields": ("graph_order",),
+                    "identity_fields": ("id",),
+                    "cardinality": "many",
+                },
+            ],
+        )
+
+        self.assertEqual([order.id for order in graph], [first_id, empty_id])
+        self.assertEqual(len(graph[0].lines), 2)
+        self.assertEqual(len(graph[0].tags), 2)
+        self.assertEqual(
+            [line.id for line in graph[0].lines], [first_line, second_line]
+        )
+        self.assertEqual(
+            [line.name for line in graph[0].lines], ["line-1", "line-2"]
+        )
+        self.assertEqual(
+            [tag.id for tag in graph[0].tags], [first_tag, second_tag]
+        )
+        self.assertEqual(graph[0].name, "first")
+        self.assertEqual(graph[1].id, empty_id)
+        self.assertEqual(graph[1].lines, [])
+        self.assertEqual(graph[1].tags, [])
+        self.assertEqual(len(rows), 5)
+        self.assertNotIn("lines", rows.records[0].graph_order)
+
+        assembled_again = rows.assemble_graph("graph_order", [])
+        self.assertIsNot(graph[0], assembled_again[0])
+
+    def test_self_relation_aliases_composite_key_and_missing_child(self):
+        db = DAL("sqlite:memory")
+        db.define_table(
+            "graph_employee", Field("name"), Field("manager_id", "integer")
+        )
+        db.graph_employee.insert(id=1, name="self-managed", manager_id=1)
+        db.graph_employee.insert(id=2, name="independent", manager_id=None)
+        manager = db.graph_employee.with_alias("graph_manager")
+
+        rows = db().select(
+            db.graph_employee.ALL,
+            manager.ALL,
+            left=manager.on(db.graph_employee.manager_id == manager.id),
+            orderby=db.graph_employee.id,
+        )
+        graph = rows.assemble_graph(
+            ("graph_employee", "id"),
+            [
+                {
+                    "name": "manager",
+                    "parent": "graph_employee",
+                    "child": "graph_manager",
+                    "parent_fields": ("manager_id",),
+                    "child_fields": ("id",),
+                    "identity_fields": ("id",),
+                    "cardinality": "one",
+                }
+            ],
+        )
+
+        self.assertEqual(graph[0].id, 1)
+        self.assertEqual(graph[0].manager.id, 1)
+        self.assertEqual(graph[0].manager.name, "self-managed")
+        self.assertIsNot(graph[0], graph[0].manager)
+        self.assertIsNone(graph[1].manager)
+
+        db.define_table(
+            "graph_invoice",
+            Field("tenant"),
+            Field("number"),
+            primarykey=["tenant", "number"],
+        )
+        db.define_table(
+            "graph_invoice_line",
+            Field("tenant"),
+            Field("invoice_number"),
+            Field("line_no", "integer"),
+            Field("name"),
+            primarykey=["tenant", "invoice_number", "line_no"],
+        )
+        db.graph_invoice.insert(tenant="acme", number="INV-1")
+        db.graph_invoice_line.insert(
+            tenant="acme", invoice_number="INV-1", line_no=2, name="second"
+        )
+        db.graph_invoice_line.insert(
+            tenant="acme", invoice_number="INV-1", line_no=1, name="first"
+        )
+
+        rows = db().select(
+            db.graph_invoice.ALL,
+            db.graph_invoice_line.ALL,
+            left=db.graph_invoice_line.on(
+                (db.graph_invoice.tenant == db.graph_invoice_line.tenant)
+                & (
+                    db.graph_invoice.number
+                    == db.graph_invoice_line.invoice_number
+                )
+            ),
+            orderby=db.graph_invoice_line.line_no,
+        )
+        graph = rows.assemble_graph(
+            ("graph_invoice", ("tenant", "number")),
+            [
+                {
+                    "name": "lines",
+                    "parent": "graph_invoice",
+                    "child": "graph_invoice_line",
+                    "parent_fields": ("tenant", "number"),
+                    "child_fields": ("tenant", "invoice_number"),
+                    "identity_fields": ("tenant", "invoice_number", "line_no"),
+                    "cardinality": "many",
+                }
+            ],
+        )
+
+        self.assertEqual(graph[0].tenant, "acme")
+        self.assertEqual(graph[0].number, "INV-1")
+        self.assertEqual(
+            [(line.line_no, line.name) for line in graph[0].lines],
+            [(1, "first"), (2, "second")],
+        )
+
+        customer = db.define_table("graph_customer", Field("name"))
+        order_table = db.define_table(
+            "graph_customer_order",
+            Field("graph_customer", customer),
+            Field("code"),
+        )
+        item = db.define_table(
+            "graph_customer_item",
+            Field("graph_customer_order", order_table),
+            Field("name"),
+        )
+        customer_id = db.graph_customer.insert(name="customer")
+        order_id = db.graph_customer_order.insert(
+            graph_customer=customer_id, code="C-1"
+        )
+        db.graph_customer_item.insert(
+            graph_customer_order=order_id, name="item-1"
+        )
+        nested_rows = db().select(
+            db.graph_customer.ALL,
+            db.graph_customer_order.ALL,
+            db.graph_customer_item.ALL,
+            left=[
+                db.graph_customer_order.on(
+                    db.graph_customer.id
+                    == db.graph_customer_order.graph_customer
+                ),
+                db.graph_customer_item.on(
+                    db.graph_customer_order.id
+                    == db.graph_customer_item.graph_customer_order
+                ),
+            ],
+        )
+        nested_graph = nested_rows.assemble_graph(
+            "graph_customer",
+            [
+                {
+                    "name": "items",
+                    "parent": "graph_customer_order",
+                    "child": "graph_customer_item",
+                    "parent_fields": ("id",),
+                    "child_fields": ("graph_customer_order",),
+                    "identity_fields": ("id",),
+                    "cardinality": "many",
+                },
+                {
+                    "name": "orders",
+                    "parent": "graph_customer",
+                    "child": "graph_customer_order",
+                    "parent_fields": ("id",),
+                    "child_fields": ("graph_customer",),
+                    "identity_fields": ("id",),
+                    "cardinality": "many",
+                },
+            ],
+        )
+        self.assertEqual(nested_graph[0].orders[0].items[0].name, "item-1")
+
+    def test_reports_scalar_and_one_to_one_conflicts(self):
+        db = DAL("sqlite:memory")
+        db.define_table("graph_conflict_order", Field("name"))
+        db.define_table(
+            "graph_conflict_line",
+            Field("graph_conflict_order", db.graph_conflict_order),
+            Field("name"),
+        )
+        order_id = db.graph_conflict_order.insert(name="order")
+        db.graph_conflict_line.insert(
+            graph_conflict_order=order_id, name="line"
+        )
+        rows = db().select(
+            db.graph_conflict_order.ALL,
+            db.graph_conflict_line.ALL,
+            left=db.graph_conflict_line.on(
+                db.graph_conflict_order.id
+                == db.graph_conflict_line.graph_conflict_order
+            ),
+        )
+        duplicate = Row(
+            graph_conflict_order=Row(dict(rows.records[0].graph_conflict_order)),
+            graph_conflict_line=Row(dict(rows.records[0].graph_conflict_line)),
+        )
+        duplicate.graph_conflict_order.name = "conflicting"
+        conflicting = type(rows)(
+            db,
+            [rows.records[0], duplicate],
+            rows.colnames,
+            fields=rows.fields,
+        )
+
+        with self.assertRaises(GraphAssemblyError):
+            conflicting.assemble_graph("graph_conflict_order", [])
+
+        db.define_table(
+            "graph_profile",
+            Field("graph_conflict_order", db.graph_conflict_order),
+            Field("code"),
+        )
+        db.graph_profile.insert(graph_conflict_order=order_id, code="A")
+        db.graph_profile.insert(graph_conflict_order=order_id, code="B")
+        rows = db().select(
+            db.graph_conflict_order.ALL,
+            db.graph_profile.ALL,
+            left=db.graph_profile.on(
+                db.graph_conflict_order.id
+                == db.graph_profile.graph_conflict_order
+            ),
+        )
+
+        with self.assertRaises(GraphAssemblyError):
+            rows.assemble_graph(
+                "graph_conflict_order",
+                [
+                    {
+                        "name": "profile",
+                        "parent": "graph_conflict_order",
+                        "child": "graph_profile",
+                        "parent_fields": ("id",),
+                        "child_fields": ("graph_conflict_order",),
+                        "identity_fields": ("id",),
+                        "cardinality": "one",
+                    }
+                ],
+            )
 
 
 class TestMinMaxSumAvg(DALtest):

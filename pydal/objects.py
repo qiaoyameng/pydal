@@ -45,7 +45,7 @@ from os.path import exists, join as pjoin
 
 from ._globals import AND, DEFAULT, IDENTITY, OR
 from .utils import hashlib_md5, to_bytes, to_native, to_unicode
-from .exceptions import NotAuthorizedException, NotFoundException
+from .exceptions import GraphAssemblyError, NotAuthorizedException, NotFoundException
 from .helpers.classes import (
     SQLALL,
     BasicStorage,
@@ -3982,6 +3982,362 @@ class Rows(BasicRows):
             for row in self:
                 row[name] = maps.get(row.id, [])
         return self
+
+    def assemble_graph(self, root, relations=()):
+        """
+        Fold a Cartesian-style joined result into a graph of ``Row`` nodes.
+
+        ``root`` is the root alias or ``(alias, identity_fields)``. Each
+        relation declares its parent and child aliases, the fields used to
+        match that edge, the child identity fields, and ``"one"`` or
+        ``"many"`` cardinality::
+
+            rows.assemble_graph(
+                ("order_head", ("tenant", "number")),
+                [
+                    {
+                        "name": "lines",
+                        "parent": "order_head",
+                        "child": "order_line",
+                        "parent_fields": ("tenant", "number"),
+                        "child_fields": ("tenant", "head_number"),
+                        "identity_fields": ("tenant", "line_no"),
+                        "cardinality": "many",
+                    }
+                ],
+            )
+
+        The result is a root-ordered plain list of newly created ``Row``
+        objects. One-to-one edges are ``None`` when an outer join found no
+        child; one-to-many edges are lists. Conflicting scalar values for the
+        same node identity raise ``GraphAssemblyError``. All identity maps are
+        local to this call; ordinary Rows iteration and ``Rows.join()`` are
+        unchanged.
+        """
+        root_alias, root_identity_fields = self._graph_node_spec(root)
+        columns = self._graph_columns()
+        if root_alias not in columns:
+            raise GraphAssemblyError(
+                "Root alias %r is not present in the result" % root_alias
+            )
+
+        missing_identity = [
+            field
+            for field in root_identity_fields
+            if field not in columns[root_alias]
+        ]
+        if missing_identity:
+            raise GraphAssemblyError(
+                "Root identity field %r.%s is missing"
+                % (root_alias, ".".join(missing_identity))
+            )
+
+        graph_relations = []
+        identity_fields_by_alias = {root_alias: root_identity_fields}
+        relation_names = set()
+        for relation in relations:
+            graph_relation = self._graph_relation(relation, columns)
+            if graph_relation.name in relation_names:
+                raise GraphAssemblyError(
+                    "Duplicate graph relation %r" % graph_relation.name
+                )
+            if graph_relation.name in columns[graph_relation.parent]:
+                raise GraphAssemblyError(
+                    "Relation %r conflicts with a scalar field on %r"
+                    % (graph_relation.name, graph_relation.parent)
+                )
+            relation_names.add(graph_relation.name)
+            graph_relations.append(graph_relation)
+            current_identity_fields = identity_fields_by_alias.get(
+                graph_relation.child
+            )
+            if current_identity_fields is None:
+                identity_fields_by_alias[graph_relation.child] = (
+                    graph_relation.identity_fields
+                )
+            elif current_identity_fields != graph_relation.identity_fields:
+                raise GraphAssemblyError(
+                    "Alias %r was declared with inconsistent identity fields"
+                    % graph_relation.child
+                )
+
+        for graph_relation in graph_relations:
+            identity_alias = graph_relation.child
+            missing_identity = [
+                field
+                for field in graph_relation.identity_fields
+                if field not in columns[identity_alias]
+            ]
+            if missing_identity:
+                raise GraphAssemblyError(
+                    "Identity field %r.%s is missing"
+                    % (identity_alias, ".".join(missing_identity))
+                )
+            for alias, fields in (
+                (graph_relation.parent, graph_relation.parent_fields),
+                (graph_relation.child, graph_relation.child_fields),
+            ):
+                missing = [field for field in fields if field not in columns[alias]]
+                if missing:
+                    raise GraphAssemblyError(
+                        "Relation %r is missing selected field %r.%s"
+                        % (graph_relation.name, alias, ".".join(missing))
+                    )
+            if graph_relation.parent not in identity_fields_by_alias:
+                raise GraphAssemblyError(
+                    "Relation %r parent alias %r has no identity declaration"
+                    % (graph_relation.name, graph_relation.parent)
+                )
+
+        nodes = {}
+        root_order = []
+        root_nodes = {}
+
+        def node_key(source_row, alias, required=False):
+            fields = identity_fields_by_alias[alias]
+            section = source_row.get(alias)
+            if section is None:
+                if required:
+                    raise GraphAssemblyError(
+                        "Root alias %r is missing from a result row" % alias
+                    )
+                return None
+            values = []
+            for field_name in fields:
+                if field_name not in section:
+                    raise GraphAssemblyError(
+                        "Identity field %r.%s is missing"
+                        % (alias, field_name)
+                    )
+                values.append(section[field_name])
+            if all(value is None for value in values):
+                if required:
+                    raise GraphAssemblyError(
+                        "Root identity %r.%s is null" % (alias, ".".join(fields))
+                    )
+                return None
+            if any(value is None for value in values):
+                raise GraphAssemblyError(
+                    "Identity %r.%s has a null component"
+                    % (alias, ".".join(fields))
+                )
+            try:
+                hash(tuple(values))
+            except TypeError:
+                raise GraphAssemblyError(
+                    "Identity %r.%s must contain hashable values"
+                    % (alias, ".".join(fields))
+                )
+            return tuple(values) if len(values) > 1 else values[0]
+
+        def get_node(alias, identity):
+            return nodes.setdefault((alias, identity), self.db.Row())
+
+        def initialize_relations(node, alias):
+            for graph_relation in graph_relations:
+                if graph_relation.parent == alias:
+                    node[graph_relation.name] = (
+                        []
+                        if graph_relation.cardinality == "many"
+                        else None
+                    )
+
+        def merge_node(source_row, alias, identity, new_node=False):
+            node = get_node(alias, identity)
+            section = source_row[alias]
+            for field_name in columns[alias]:
+                if field_name not in section:
+                    continue
+                value = section[field_name]
+                if field_name in node and node[field_name] != value:
+                    raise GraphAssemblyError(
+                        "Conflicting values for %r.%s on node %r: %r != %r"
+                        % (alias, field_name, identity, node[field_name], value)
+                    )
+                node[field_name] = value
+            if new_node:
+                initialize_relations(node, alias)
+            return node
+
+        def relation_values(section, fields):
+            values = []
+            for field_name in fields:
+                if field_name not in section:
+                    return None
+                values.append(section[field_name])
+            if any(value is None for value in values):
+                return None
+            return tuple(values) if len(values) > 1 else values[0]
+
+        for source_row in self.records:
+            root_identity = node_key(source_row, root_alias, required=True)
+            root_is_new = root_identity not in root_nodes
+            root_node = merge_node(
+                source_row,
+                root_alias,
+                root_identity,
+                new_node=root_is_new,
+            )
+            if root_is_new:
+                root_nodes[root_identity] = root_node
+                root_order.append(root_identity)
+
+            for graph_relation in graph_relations:
+                identity = node_key(source_row, graph_relation.child)
+                if identity is None:
+                    continue
+                child_alias = graph_relation.child
+                child_key = (child_alias, identity)
+                child_is_new = child_key not in nodes
+                merge_node(
+                    source_row,
+                    child_alias,
+                    identity,
+                    new_node=child_is_new,
+                )
+
+        linked_edges = set()
+        for source_row in self.records:
+            identities = {
+                alias: (
+                    node_key(source_row, alias, required=alias == root_alias)
+                )
+                for alias in identity_fields_by_alias
+            }
+            for graph_relation in graph_relations:
+                parent_identity = identities.get(graph_relation.parent)
+                child_identity = identities.get(graph_relation.child)
+                if parent_identity is None or child_identity is None:
+                    continue
+
+                parent_section = source_row[graph_relation.parent]
+                child_section = source_row[graph_relation.child]
+                parent_value = relation_values(
+                    parent_section, graph_relation.parent_fields
+                )
+                child_value = relation_values(
+                    child_section, graph_relation.child_fields
+                )
+                if parent_value is None or child_value is None:
+                    continue
+                if parent_value != child_value:
+                    continue
+
+                parent_node = get_node(graph_relation.parent, parent_identity)
+                child_node = get_node(graph_relation.child, child_identity)
+                edge_key = (graph_relation.name, parent_identity, child_identity)
+                if edge_key in linked_edges:
+                    continue
+
+                if graph_relation.cardinality == "one":
+                    current = parent_node.get(graph_relation.name)
+                    if current is not None and current is not child_node:
+                        raise GraphAssemblyError(
+                            "One-to-one relation %r on node %r matched more "
+                            "than one child"
+                            % (graph_relation.name, parent_identity)
+                        )
+                    parent_node[graph_relation.name] = child_node
+                else:
+                    parent_node[graph_relation.name].append(child_node)
+                linked_edges.add(edge_key)
+
+        return [root_nodes[identity] for identity in root_order]
+
+    @staticmethod
+    def _graph_node_spec(spec):
+        if isinstance(spec, str):
+            return spec, ("id",)
+        if isinstance(spec, (tuple, list)) and len(spec) == 2:
+            alias, fields = spec
+            if isinstance(alias, str):
+                return alias, Rows._graph_fields(fields)
+        raise GraphAssemblyError("Invalid graph node specification: %r" % (spec,))
+
+    @staticmethod
+    def _graph_fields(fields):
+        if isinstance(fields, str):
+            fields = (fields,)
+        try:
+            fields = tuple(fields)
+        except TypeError:
+            fields = (fields,)
+        if not fields or not all(isinstance(field, str) for field in fields):
+            raise GraphAssemblyError("Identity fields must be one or more strings")
+        return fields
+
+    @staticmethod
+    def _graph_relation(relation, columns):
+        if not isinstance(relation, dict):
+            raise GraphAssemblyError("Graph relation must be a mapping")
+        name = relation.get("name")
+        parent = relation.get("parent")
+        child = relation.get("child")
+        if not name or not parent or not child:
+            raise GraphAssemblyError(
+                "Graph relation requires name, parent and child aliases"
+            )
+        for alias in (parent, child):
+            if alias not in columns:
+                raise GraphAssemblyError(
+                    "Relation alias %r is not present in the result" % alias
+                )
+
+        identity_fields = Rows._graph_fields(
+            relation.get("identity_fields", relation.get("child_identity_fields"))
+        )
+        parent_fields = relation.get("parent_fields", identity_fields)
+        child_fields = relation.get("child_fields", identity_fields)
+        parent_fields = Rows._graph_fields(parent_fields)
+        child_fields = Rows._graph_fields(child_fields)
+        if len(parent_fields) != len(child_fields):
+            raise GraphAssemblyError(
+                "Relation %r join fields must have the same length" % name
+            )
+
+        cardinality = relation.get("cardinality", "many")
+        cardinality_aliases = {
+            "one": "one",
+            "1": "one",
+            1: "one",
+            "many": "many",
+            "*": "many",
+        }
+        if cardinality not in cardinality_aliases:
+            raise GraphAssemblyError(
+                "Relation %r cardinality must be 'one' or 'many'" % name
+            )
+        return type(
+            "GraphRelation",
+            (),
+            {
+                "name": name,
+                "parent": parent,
+                "child": child,
+                "parent_fields": parent_fields,
+                "child_fields": child_fields,
+                "identity_fields": identity_fields,
+                "cardinality": cardinality_aliases[cardinality],
+            },
+        )()
+
+    def _graph_columns(self):
+        columns = OrderedDict()
+        fields = self.fields or [None] * len(self.colnames)
+        for colname, field in zip(self.colnames, fields):
+            alias = field_name = None
+            if hasattr(field, "tablename") and hasattr(field, "name"):
+                alias, field_name = field.tablename, field.name
+            else:
+                parts = colname.split(".")
+                if len(parts) >= 2:
+                    alias = parts[-2].strip('"')
+                    field_name = parts[-1].strip('"')
+            if alias and field_name:
+                columns.setdefault(alias, [])
+                if field_name not in columns[alias]:
+                    columns[alias].append(field_name)
+        return columns
 
     def group_by_value(self, *fields, **args):
         """

@@ -8,6 +8,7 @@ Public API exposed at the package root:
 * ``SQLCustomType`` — descriptor for backend-specific column types.
 * ``QueryBuilder`` — natural-language → ``Query`` parser.
 * ``QueryParseError`` — raised by ``QueryBuilder`` on parse failure.
+* ``GraphAssemblyError`` — raised when explicit graph assembly is invalid.
 * ``geoPoint`` / ``geoLine`` / ``geoPolygon`` — WKT geometry helpers.
 
 See ``README.md`` for the full API tour.
@@ -16,6 +17,7 @@ See ``README.md`` for the full API tour.
 __version__ = "1.20260520.0"
 
 from .base import DAL
+from .exceptions import GraphAssemblyError
 from .helpers.classes import SQLCustomType
 from .helpers.methods import geoLine, geoPoint, geoPolygon
 from .objects import Field
@@ -24,6 +26,7 @@ from .querybuilder import QueryBuilder, QueryParseError
 __all__ = [
     "DAL",
     "Field",
+    "GraphAssemblyError",
     "SQLCustomType",
     "QueryBuilder",
     "QueryParseError",
