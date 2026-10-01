@@ -30,6 +30,7 @@ from .querybuilder import *
 from .restapi import *
 from .scheduler import *
 from .smart_query import *
+from .sqlite_functions import *
 from .tags import *
 from .validation import *
 from .validators import *

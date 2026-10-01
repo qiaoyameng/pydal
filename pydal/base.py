@@ -779,6 +779,84 @@ class DAL(Serializable, BasicStorage, metaclass=MetaDAL):
     def smart_query(self, fields, text):
         return Set(self, smart_query(fields, text))
 
+    def register_sqlite_aggregate(
+        self,
+        name,
+        narg,
+        aggregate_class=None,
+        step=None,
+        finalize=None,
+        initial=None,
+        replace=False,
+    ):
+        """Register an SQLite aggregate on this DAL's current and future connections.
+
+        Either supply an sqlite3-compatible aggregate class, or step and
+        finalize callbacks. The callback state is created separately for each
+        aggregate instance. An executing statement keeps the function it
+        started with; later statements use the replacement.
+        """
+        method = getattr(self._adapter, "register_sqlite_aggregate", None)
+        if method is None:
+            raise NotImplementedError("SQLite aggregates require a SQLite DAL")
+        return method(
+            name,
+            narg,
+            aggregate_class=aggregate_class,
+            step=step,
+            finalize=finalize,
+            initial=initial,
+            replace=replace,
+        )
+
+    def register_sqlite_window_function(
+        self,
+        name,
+        narg,
+        window_class=None,
+        step=None,
+        inverse=None,
+        value=None,
+        finalize=None,
+        initial=None,
+        replace=False,
+    ):
+        """Register an SQLite window function on this DAL's connections.
+
+        Either supply an sqlite3-compatible window class, or step, inverse,
+        value, and finalize callbacks. The function is installed on existing
+        and future connections; an executing statement keeps its original
+        implementation.
+        """
+        method = getattr(self._adapter, "register_sqlite_window_function", None)
+        if method is None:
+            raise NotImplementedError("SQLite window functions require a SQLite DAL")
+        return method(
+            name,
+            narg,
+            window_class=window_class,
+            step=step,
+            inverse=inverse,
+            value=value,
+            finalize=finalize,
+            initial=initial,
+            replace=replace,
+        )
+
+    def unregister_sqlite_aggregate(self, name, narg):
+        """Remove this DAL's aggregate selected by name and argument count."""
+        method = getattr(self._adapter, "unregister_sqlite_aggregate", None)
+        if method is None:
+            raise NotImplementedError("SQLite aggregates require a SQLite DAL")
+        return method(name, narg)
+
+    def unregister_sqlite_window_function(self, name, narg):
+        """Remove this DAL's window function selected by name and argument count."""
+        method = getattr(self._adapter, "unregister_sqlite_window_function", None)
+        if method is None:
+            raise NotImplementedError("SQLite window functions require a SQLite DAL")
+        return method(name, narg)
+
     def __call__(self, query=None, ignore_common_filters=None):
         return self.where(query, ignore_common_filters)
 
