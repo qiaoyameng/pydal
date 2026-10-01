@@ -22,7 +22,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from . import ast
 from .helpers.methods import merge_tablemaps, use_common_filters, xorify
-from .objects import DialectOp, Expression, Field, Query, Select, Table
+from .objects import DialectOp, Expression, Field, Query, RowValue, Select, Table
 
 
 # Op names that translate as straight BinOp(name, left, right) with no
@@ -95,8 +95,12 @@ def to_ast(value: Any, type_hint: Optional[str] = None) -> ast.Node:
         # bake it into the node so the compiler doesn't need to walk
         # back through pydal metadata to render the column reference.
         return ast.FieldRef(value._tablename, value.name, sqlsafe=value.sqlsafe)
+    if isinstance(value, RowValue):
+        return _row_value_to_ast(value)
     if isinstance(value, Select):
         return _select_to_ast(value)
+    if isinstance(value, Expression) and value.op is None and value.first is None:
+        return ast.Literal(value.second, value.type)
     if isinstance(value, (Expression, Query)):
         return _expr_to_ast(value)
     return ast.Literal(value, type_hint)
@@ -128,6 +132,16 @@ def _field_type(node: Any) -> Optional[str]:
     return t if isinstance(t, str) else None
 
 
+def _row_value_to_ast(row: RowValue) -> ast.RowValue:
+    elements = []
+    for column in row.columns:
+        element = to_ast(column)
+        if isinstance(element, ast.Aliased):
+            element = element.node
+        elements.append(element)
+    return ast.RowValue(tuple(elements), tuple(row.types))
+
+
 def _expr_to_ast(expr) -> ast.Node:
     op = expr.op
     f, s = expr.first, expr.second
@@ -143,6 +157,33 @@ def _expr_to_ast(expr) -> ast.Node:
     if name is None:
         # Defensive: unknown op shape. Preserve as opaque function call.
         return ast.FuncCall(repr(op), _args_of(f, s))
+
+    if isinstance(f, RowValue) and name in (
+        "row_eq",
+        "row_ne",
+        "row_lt",
+        "row_lte",
+        "row_gt",
+        "row_gte",
+    ):
+        return ast.RowComparison(
+            name.removeprefix("row_"),
+            _row_value_to_ast(f),
+            _row_value_to_ast(s),
+        )
+
+    if isinstance(f, RowValue) and name in ("row_in", "row_not_in"):
+        if isinstance(s, ast.Node):
+            values = (s,)
+        elif isinstance(s, Select):
+            values = (_select_to_ast(s),)
+        elif isinstance(s, (list, tuple)):
+            values = tuple(_row_value_to_ast(row) for row in s)
+        else:
+            values = (_row_value_to_ast(s),)
+        return ast.RowInList(
+            _row_value_to_ast(f), values, negated=name == "row_not_in"
+        )
 
     # ---------- logical ----------
     if name == "_and":
@@ -350,6 +391,8 @@ def set_to_select(
             raise NotImplementedError(
                 "set_to_select: %r is not yet supported" % unsupported
             )
+    if fields is not None and not isinstance(fields, (list, tuple)):
+        fields = (fields,)
 
     db = s.db
     adapter = db._adapter

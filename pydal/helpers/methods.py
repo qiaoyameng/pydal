@@ -86,7 +86,7 @@ def xorify(orderby: Optional[Sequence[Any]]) -> Any:
 def use_common_filters(query: Any) -> bool:
     """True iff ``query`` exists and hasn't opted out of common filters."""
     return (
-        query
+        query is not None
         and hasattr(query, "ignore_common_filters")
         and not query.ignore_common_filters
     )

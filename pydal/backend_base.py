@@ -63,6 +63,7 @@ from .objects import (
     Query,
     Rows,
     Row,
+    RowValue,
     Select,
     Table,
     VirtualCommand,
@@ -780,7 +781,13 @@ class BaseAdapter(ConnectionPool, metaclass=AdapterMeta):
     def tables(self, *queries):
         tables = dict()
         for query in queries:
-            if isinstance(query, Field):
+            from . import ast
+
+            if isinstance(query, RowValue):
+                tables = merge_tablemaps(tables, self.tables(*query.columns))
+            elif isinstance(query, (list, tuple)):
+                tables = merge_tablemaps(tables, self.tables(*query))
+            elif isinstance(query, Field):
                 key = query.tablename
                 if tables.get(key, query.table) is not query.table:
                     raise ValueError("Name conflict in table list: %s" % key)
@@ -788,6 +795,8 @@ class BaseAdapter(ConnectionPool, metaclass=AdapterMeta):
             elif isinstance(query, (Expression, Query)):
                 tmp = [x for x in (query.first, query.second) if x is not None]
                 tables = merge_tablemaps(tables, self.tables(*tmp))
+            elif isinstance(query, ast.Node):
+                continue
         return tables
 
     def get_table(self, *queries):
@@ -2178,6 +2187,59 @@ class SQLDialect(CommonDialect):
             self.expand(first, query_env=query_env),
             self.expand(second, query_env=query_env),
         )
+
+    def _row_query(self, op_name, first, second, query_env={}):
+        compiler = getattr(self.adapter, "compiler", None)
+        if compiler is None:
+            raise NotImplementedError("row values require an SQL compiler")
+        from . import ast
+        from .ast_translate import to_ast
+
+        if op_name in ("row_eq", "row_ne", "row_lt", "row_lte", "row_gt", "row_gte"):
+            node = ast.RowComparison(
+                op_name.removeprefix("row_"),
+                to_ast(first),
+                to_ast(second),
+            )
+        else:
+            if isinstance(second, ast.Node):
+                values = (second,)
+            elif isinstance(second, Select):
+                from .ast_translate import _select_to_ast
+
+                values = (_select_to_ast(second),)
+            else:
+                values = tuple(to_ast(row) for row in second)
+            node = ast.RowInList(
+                to_ast(first),
+                values,
+                negated=op_name == "row_not_in",
+            )
+        return compiler.compile_expression(node)
+
+    def row_eq(self, first, second, query_env={}):
+        return self._row_query("row_eq", first, second, query_env)
+
+    def row_ne(self, first, second, query_env={}):
+        return self._row_query("row_ne", first, second, query_env)
+
+    def row_lt(self, first, second, query_env={}):
+        return self._row_query("row_lt", first, second, query_env)
+
+    def row_lte(self, first, second, query_env={}):
+        return self._row_query("row_lte", first, second, query_env)
+
+    def row_gt(self, first, second, query_env={}):
+        return self._row_query("row_gt", first, second, query_env)
+
+    def row_gte(self, first, second, query_env={}):
+        return self._row_query("row_gte", first, second, query_env)
+
+    def row_in(self, first, second, query_env={}):
+        return self._row_query("row_in", first, second, query_env)
+
+    def row_not_in(self, first, second, query_env={}):
+        return self._row_query("row_not_in", first, second, query_env)
 
     def belongs(self, first, second, query_env={}):
         ftype = first.type

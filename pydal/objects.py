@@ -1662,6 +1662,235 @@ def _abstract_op(db, op):
     return op
 
 
+_ROW_SCALAR_TYPES = frozenset(
+    (
+        "id",
+        "big-id",
+        "integer",
+        "bigint",
+        "float",
+        "double",
+        "boolean",
+        "date",
+        "time",
+        "datetime",
+        "string",
+        "text",
+        "password",
+    )
+)
+
+
+def _row_base_type(field_type):
+    if not isinstance(field_type, str):
+        if isinstance(field_type, SQLCustomType):
+            field_type = field_type.type
+        else:
+            return None
+    base_type = REGEX_TYPE.match(field_type).group(0)
+    if base_type in ("reference", "big-reference"):
+        return "integer"
+    return base_type
+
+
+def _validate_row_value(value, field_type, position):
+    base_type = _row_base_type(field_type)
+    if base_type is None or (
+        base_type not in _ROW_SCALAR_TYPES and not base_type.startswith("decimal")
+    ):
+        raise ValueError(
+            "Row value column %d has unsupported type %r"
+            % (position + 1, field_type)
+        )
+    if value is None:
+        return
+    valid = False
+    if base_type in ("id", "big-id", "integer", "bigint"):
+        valid = isinstance(value, int) and not isinstance(value, bool)
+    elif base_type in ("float", "double") or base_type.startswith("decimal"):
+        valid = isinstance(value, (int, float, decimal.Decimal)) and not isinstance(
+            value, bool
+        )
+    elif base_type == "boolean":
+        valid = isinstance(value, bool)
+    elif base_type in ("string", "text", "password"):
+        valid = isinstance(value, (str, int, float, decimal.Decimal))
+    elif base_type == "date":
+        valid = isinstance(value, (datetime.date, str))
+    elif base_type == "time":
+        valid = isinstance(value, (datetime.time, str))
+    elif base_type == "datetime":
+        valid = isinstance(value, (datetime.datetime, datetime.date, str))
+    if not valid:
+        raise ValueError(
+            "Row value at column %d is not compatible with type %r"
+            % (position + 1, field_type)
+        )
+
+
+def _row_dimension(value):
+    from . import ast as _ast
+
+    if isinstance(value, _ast.Select):
+        return len(value.fields)
+    if isinstance(value, Select):
+        return len(value._qfields)
+    return None
+
+
+def _row_canonical_key(row):
+    return tuple((type(value).__name__, repr(value)) for value in row)
+
+
+class _RowValue(object):
+    """A typed SQL row constructor made of two or more expressions."""
+
+    def __init__(self, *columns):
+        if len(columns) < 2:
+            raise ValueError("RowValue requires at least 2 columns")
+        db = None
+        normalized = []
+        types = []
+        for position, column in enumerate(columns):
+            if not isinstance(column, Expression):
+                raise TypeError("RowValue columns must be field expressions")
+            if column.db is None:
+                raise ValueError("RowValue columns must be bound to a DAL")
+            if db is None:
+                db = column.db
+            elif column.db is not db:
+                raise ValueError("RowValue columns must belong to the same DAL")
+            column_type = _row_base_type(column.type)
+            if not column_type:
+                raise ValueError(
+                    "Row value column %d has unknown type" % (position + 1)
+                )
+            _validate_row_value(None, column_type, position)
+            normalized.append(column)
+            types.append(
+                column.type.type
+                if isinstance(column.type, SQLCustomType)
+                else column.type
+            )
+        self.db = self._db = db
+        self.op = None
+        self.first = None
+        self.second = None
+        self.columns = tuple(normalized)
+        self.types = tuple(types)
+        self.type = None
+        self._itype = None
+        self._table = getattr(normalized[0], "_table", None)
+        self.tablename = getattr(normalized[0], "tablename", None)
+        self.optional_args = {}
+
+    def _check_row(self, other):
+        if not isinstance(other, RowValue):
+            raise TypeError("comparison requires another RowValue")
+        if other.db is not self.db:
+            raise ValueError("RowValue operands must belong to the same DAL")
+        if len(other.columns) != len(self.columns):
+            raise ValueError(
+                "Row value dimension mismatch: %d != %d"
+                % (len(self.columns), len(other.columns))
+            )
+        return other
+
+    def _constant_row(self, row):
+        if isinstance(row, RowValue):
+            return self._check_row(row)
+        if not isinstance(row, (list, tuple)):
+            raise TypeError("row comparison value must be a tuple or RowValue")
+        if len(row) != len(self.columns):
+            raise ValueError(
+                "Row value dimension mismatch: %d != %d"
+                % (len(row), len(self.columns))
+            )
+        columns = []
+        for position, (field, value) in enumerate(zip(self.columns, row)):
+            _validate_row_value(value, field.type, position)
+            field_type = (
+                field.type.type
+                if isinstance(field.type, SQLCustomType)
+                else field.type
+            )
+            columns.append(
+                Expression(self.db, None, None, value, type=field_type)
+            )
+        return RowValue(*columns)
+
+    def __eq__(self, row):
+        row = self._constant_row(row)
+        return Query(self.db, self._dialect.row_eq, self, row)
+
+    def __ne__(self, row):
+        row = self._constant_row(row)
+        return Query(self.db, self._dialect.row_ne, self, row)
+
+    def __lt__(self, row):
+        row = self._constant_row(row)
+        return Query(self.db, self._dialect.row_lt, self, row)
+
+    def __le__(self, row):
+        row = self._constant_row(row)
+        return Query(self.db, self._dialect.row_lte, self, row)
+
+    def __gt__(self, row):
+        row = self._constant_row(row)
+        return Query(self.db, self._dialect.row_gt, self, row)
+
+    def __ge__(self, row):
+        row = self._constant_row(row)
+        return Query(self.db, self._dialect.row_gte, self, row)
+
+    def _normalize_rows(self, values):
+        from . import ast as _ast
+
+        if len(values) == 1:
+            value = values[0]
+            dimension = _row_dimension(value)
+            if dimension is not None:
+                if dimension != len(self.columns):
+                    raise ValueError(
+                        "Row subquery dimension mismatch: %d != %d"
+                        % (dimension, len(self.columns))
+                    )
+                return value
+            if isinstance(value, str) or not isinstance(value, (list, tuple, set)):
+                raise TypeError("row belongs() requires rows or a subquery")
+            values = value
+
+        normalized = []
+        for row in values:
+            if isinstance(row, RowValue):
+                normalized.append(self._check_row(row))
+            else:
+                if not isinstance(row, (list, tuple)):
+                    raise TypeError("every belongs() value must be a row")
+                normalized.append(self._constant_row(row))
+        unique = {}
+        for row in normalized:
+            if isinstance(row, RowValue):
+                key = tuple(
+                    (_row_base_type(column.type), repr(column.second))
+                    for column in row.columns
+                )
+            else:
+                key = _row_canonical_key(row)
+            unique.setdefault(key, row)
+        return [row for _, row in sorted(unique.items(), key=lambda item: item[0])]
+
+    def belongs(self, *values):
+        return Query(
+            self.db, self._dialect.row_in, self, self._normalize_rows(values)
+        )
+
+    def notbelongs(self, *values):
+        return Query(
+            self.db, self._dialect.row_not_in, self, self._normalize_rows(values)
+        )
+
+
 class Expression(object):
     """
     Base for anything that compiles to a SQL fragment.
@@ -1810,6 +2039,8 @@ class Expression(object):
     def __str__(self):
         if not self.db:
             return f"<{self.__class__.__name__}>"
+        if self.op is None and self.first is None:
+            return self.db._adapter.represent(self.second, self.type)
         if self.op == self._dialect._as:
             return self.second
         return str(self.db._adapter.expand(self, self.type))
@@ -1817,6 +2048,8 @@ class Expression(object):
     def __repr__(self):
         if not self.db:
             return f"<{self.__class__.__name__}>"
+        if self.op is None and self.first is None:
+            return self.db._adapter.represent(self.second, self.type)
         return str(self.db._adapter.expand(self, self.type))
 
     def __or__(self, other):  # for use in sortby
@@ -2126,6 +2359,10 @@ class Expression(object):
                 <Row {'testjson': {u'a': {u'a1': 2, u'a0': 1}, u'c': {u'c0': {u'c01': [2, 4]}}, u'b': 3}, 'id': 1L}>
         """
         return Query(self.db, self._dialect.json_contains, self, jsonvalue)
+
+
+class RowValue(_RowValue, Expression):
+    pass
 
 
 class FieldVirtual(object):
@@ -2807,6 +3044,9 @@ class Query(Serializable):
     def _dialect(self):
         return self.db._adapter.dialect
 
+    def __bool__(self):
+        return True
+
     def __repr__(self):
         return "<Query %s>" % str(self)
 
@@ -2872,21 +3112,36 @@ class Query(Serializable):
         )
 
         def loop(d):
+            def serialize(value):
+                if isinstance(value, self.__class__):
+                    return loop(value.__dict__)
+                if isinstance(value, Field):
+                    return {
+                        "tablename": value._tablename,
+                        "fieldname": value.name,
+                    }
+                if isinstance(value, RowValue):
+                    return {
+                        "op": "ROW",
+                        "elements": [serialize(column) for column in value.columns],
+                        "types": list(value.types),
+                    }
+                if isinstance(value, Expression):
+                    return loop(value.__dict__)
+                if isinstance(value, (list, tuple)):
+                    return [serialize(item) for item in value]
+                if isinstance(value, SERIALIZABLE_TYPES):
+                    return value
+                if isinstance(
+                    value, (datetime.date, datetime.time, datetime.datetime)
+                ):
+                    return str(value)
+                return repr(value)
+
             newd = dict()
             for k, v in d.items():
                 if k in ("first", "second"):
-                    if isinstance(v, self.__class__):
-                        newd[k] = loop(v.__dict__)
-                    elif isinstance(v, Field):
-                        newd[k] = {"tablename": v._tablename, "fieldname": v.name}
-                    elif isinstance(v, Expression):
-                        newd[k] = loop(v.__dict__)
-                    elif isinstance(v, SERIALIZABLE_TYPES):
-                        newd[k] = v
-                    elif isinstance(
-                        v, (datetime.date, datetime.time, datetime.datetime)
-                    ):
-                        newd[k] = str(v)
+                    newd[k] = serialize(v)
                 elif k == "op":
                     if callable(v):
                         newd[k] = v.__name__
@@ -2961,7 +3216,7 @@ class Set(Serializable):
             query = Expression(self.db, query)
         elif isinstance(query, Field):
             query = query != None
-        if self.query:
+        if self.query is not None:
             return Set(
                 self.db, self.query & query, ignore_common_filters=ignore_common_filters
             )

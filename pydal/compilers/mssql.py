@@ -32,6 +32,9 @@ from .sql import SQLCompiler
 class MSSQLCompiler(SQLCompiler):
     """Base MSSQL compiler: replaces ANSI LIMIT with ``SELECT TOP N``."""
 
+    supports_row_values = False
+    placeholder_style = "format"
+
     # MSSQL has no boolean literal; a bare ``0``/``1`` is rejected in a
     # condition context, so booleans must render as real comparisons.
     true_exp = "1=1"

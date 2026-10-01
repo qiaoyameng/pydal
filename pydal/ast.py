@@ -193,6 +193,41 @@ class InList(Node):
 
 
 @dataclass(frozen=True)
+class RowValue(Node):
+    """A parenthesized row constructor, ``(expr_1, ..., expr_n)``."""
+
+    elements: Tuple[Node, ...]
+    types: Tuple[Optional[str], ...] = ()
+
+
+@dataclass(frozen=True)
+class RowComparison(Node):
+    """
+    Lexicographic comparison of two row constructors.
+
+    ``op`` is one of ``eq``, ``ne``, ``lt``, ``lte``, ``gt``, ``gte``.
+    """
+
+    op: str
+    left: RowValue
+    right: RowValue
+
+
+@dataclass(frozen=True)
+class RowInList(Node):
+    """
+    ``(left columns) IN`` or ``NOT IN`` a row list/subquery.
+
+    A constant right side is represented as nested row values. A
+    subquery is represented as a single ``Select`` node.
+    """
+
+    left: RowValue
+    values: Tuple[Node, ...]
+    negated: bool = False
+
+
+@dataclass(frozen=True)
 class Aliased(Node):
     """``expr AS alias`` — produced by ``with_alias()``."""
 
@@ -364,6 +399,9 @@ NODE_TYPES: Tuple[type, ...] = (
     UnaryOp,
     FuncCall,
     InList,
+    RowValue,
+    RowComparison,
+    RowInList,
     Aliased,
     Join,
     Cte,

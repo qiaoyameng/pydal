@@ -15,6 +15,7 @@ that responsibility into the compiler itself (or a dedicated Renderer).
 from __future__ import annotations
 
 import datetime as _datetime
+import dataclasses
 from typing import Any, Callable, List, Optional, Tuple
 
 from .. import ast
@@ -127,6 +128,7 @@ class SQLCompiler:
     parameterize: bool = False
     # DB-API placeholder style. Subclasses set this to match their driver.
     placeholder_style: str = "qmark"
+    supports_row_values: bool = True
 
     def __init__(
         self,
@@ -167,7 +169,10 @@ class SQLCompiler:
     # ------------------------------------------------------------------ entry
 
     def _begin(self) -> Optional[Ctx]:
-        if not self.parameterize:
+        return self._begin_for(None)
+
+    def _begin_for(self, node: Any) -> Optional[Ctx]:
+        if not self.parameterize and not self._requires_row_value_binding(node):
             return None
         ctx = Ctx(self.placeholder_style)
         self._ctx = ctx
@@ -183,6 +188,18 @@ class SQLCompiler:
                 sql = sql.replace("\x00pydal_param_%d\x00" % idx, "%s")
         return ParamSQL(sql, ctx.params)
 
+    def _requires_row_value_binding(self, node: Any) -> bool:
+        if isinstance(node, (ast.RowValue, ast.RowComparison, ast.RowInList)):
+            return True
+        if dataclasses.is_dataclass(node):
+            return any(
+                self._requires_row_value_binding(getattr(node, item.name))
+                for item in dataclasses.fields(node)
+            )
+        if isinstance(node, (list, tuple)):
+            return any(self._requires_row_value_binding(item) for item in node)
+        return False
+
     def compile_expression(self, node: ast.Node):
         """
         Compile a single expression node into SQL.
@@ -190,7 +207,7 @@ class SQLCompiler:
         Returns a plain ``str`` in inline mode; a ``ParamSQL`` carrying
         bound parameters when ``parameterize=True``.
         """
-        ctx = self._begin()
+        ctx = self._begin_for(node)
         try:
             sql = self.visit(node)
         finally:
@@ -207,7 +224,7 @@ class SQLCompiler:
         single-table shape: fields, sources, WHERE, GROUP BY/HAVING,
         ORDER BY, LIMIT/OFFSET, FOR UPDATE, DISTINCT(/ON).
         """
-        ctx = self._begin()
+        ctx = self._begin_for(n)
         try:
             sql = self._compile_select_body(n)
         finally:
@@ -388,7 +405,7 @@ class SQLCompiler:
         Honors ``n.sqlsafe`` for aliased writes (INSERT always targets the
         underlying physical table). Multi-row INSERT not yet supported.
         """
-        ctx = self._begin()
+        ctx = self._begin_for(n)
         try:
             table = n.sqlsafe if n.sqlsafe is not None else self._table_sql(n.table)
             if not n.rows or not n.rows[0]:
@@ -414,7 +431,7 @@ class SQLCompiler:
         Honors ``n.sqlsafe`` for aliased writes. Subqueries inside
         SET/WHERE see the UPDATE's target table as outer scope.
         """
-        ctx = self._begin()
+        ctx = self._begin_for(n)
         # Push the UPDATE target so any subquery in SET/WHERE knows the
         # outer-scope table — same correlated-subquery semantics as SELECT.
         self._scope_stack.append(frozenset({n.table}))
@@ -438,7 +455,7 @@ class SQLCompiler:
 
     def compile_delete(self, n: ast.Delete):
         """Compile a ``Delete`` AST node into ``DELETE FROM ... WHERE ...;`` SQL."""
-        ctx = self._begin()
+        ctx = self._begin_for(n)
         self._scope_stack.append(frozenset({n.table}))
         try:
             table = n.sqlsafe if n.sqlsafe is not None else self._writing_alias(n.table)
@@ -456,7 +473,7 @@ class SQLCompiler:
 
     def compile_count(self, n: ast.Count):
         """Compile a Count node into ``SELECT COUNT(...) FROM ...;``."""
-        ctx = self._begin()
+        ctx = self._begin_for(n)
         # Outer scope for correlated subqueries: this Count's source tables.
         outer = set()
         for s in n.query.sources:
@@ -705,6 +722,316 @@ class SQLCompiler:
             return "(%s IN (%s))" % (self.visit(n.expr), sub)
         items = ",".join(self.visit(v) for v in n.values)
         return "(%s IN (%s))" % (self.visit(n.expr), items)
+
+    def v_RowValue(self, n: ast.RowValue) -> str:
+        return "(%s)" % ",".join(self.visit(element) for element in n.elements)
+
+    def v_RowComparison(self, n: ast.RowComparison) -> str:
+        self._row_literal_tokens = {}
+        if self.supports_row_values:
+            symbols = {
+                "eq": "=",
+                "ne": "<>",
+                "lt": "<",
+                "lte": "<=",
+                "gt": ">",
+                "gte": ">=",
+            }
+            if n.op not in symbols:
+                raise NotImplementedError("unknown row comparison %r" % n.op)
+            return "(%s %s %s)" % (
+                self.visit(n.left),
+                symbols[n.op],
+                self.visit(n.right),
+            )
+        return self._expand_row_literal_tokens(
+            self._emulated_row_comparison(n.op, n.left, n.right)
+        )
+
+    def v_RowInList(self, n: ast.RowInList) -> str:
+        self._row_literal_tokens = {}
+        values = n.values
+        if len(values) == 1 and isinstance(values[0], ast.Select):
+            if self.supports_row_values:
+                subquery = self._render_row_subquery(values[0])
+                result = "(%s %sIN (%s))" % (
+                    self._row_value_sql(n.left),
+                    "NOT " if n.negated else "",
+                    subquery,
+                )
+                return self._expand_row_literal_tokens(result)
+            if not values[0].fields:
+                raise ValueError("row subquery must select columns")
+            return self._expand_row_literal_tokens(
+                self._emulated_row_subquery_predicate(n.left, values[0], n.negated)
+            )
+        if not values:
+            return "(1=1)" if n.negated else "(1=0)"
+        if self.supports_row_values:
+            rows = ",".join(self._row_value_sql(value) for value in values)
+            result = "(%s %sIN (%s))" % (
+                self._row_value_sql(n.left),
+                "NOT " if n.negated else "",
+                rows,
+            )
+            return self._expand_row_literal_tokens(result)
+        predicates = [
+            self._row_eq_predicate(n.left, value)
+            for value in values
+        ]
+        if not n.negated:
+            result = "(%s)" % " OR ".join(predicates)
+        else:
+            not_in_predicates = [
+                "(NOT %s)" % predicate for predicate in predicates
+            ]
+            result = "(%s)" % " AND ".join(not_in_predicates)
+        return self._expand_row_literal_tokens(result)
+
+    def _row_value_sql(self, row):
+        return "(%s)" % ",".join(
+            self._row_element_sql(element) for element in row.elements
+        )
+
+    def _row_element_sql(self, node):
+        if self._ctx is not None and isinstance(node, ast.Literal):
+            key = id(node)
+            if key not in self._row_literal_tokens:
+                self._row_literal_tokens[key] = (
+                    node,
+                    "\x00pydal_row_literal_%d\x00"
+                    % len(self._row_literal_tokens)
+                )
+            return self._row_literal_tokens[key][1]
+        return self.visit(node)
+
+    def _expand_row_literal_tokens(self, sql):
+        if self._ctx is None or not self._row_literal_tokens:
+            return sql
+        items = sorted(
+            self._row_literal_tokens.values(), key=lambda item: item[1]
+        )
+        for node, token in items:
+            while token in sql:
+                sql = sql.replace(
+                    token, self._bind_row_literal(node), 1
+                )
+        self._row_literal_tokens = {}
+        return sql
+
+    def _bind_row_literal(self, node):
+        if node.value is None:
+            return "NULL"
+        if self._ctx is not None:
+            return self._ctx.bind(self._adapt_for_bind(node.value, node.type))
+        return self.visit(node)
+
+    def _render_row_subquery(self, select):
+        body = self._compile_select_body(select)
+        if body.endswith(";"):
+            body = body[:-1]
+        return body
+
+    def _emulated_row_comparison(self, op, left, right):
+        if not isinstance(right, ast.RowValue):
+            raise ValueError("row comparison requires a row-valued right operand")
+        if len(left.elements) != len(right.elements):
+            raise ValueError("row value dimension mismatch")
+        if op == "lt":
+            return self._row_lt_predicate(left, right)
+        if op == "lte":
+            return self._row_lte_predicate(left, right)
+        if op == "gt":
+            return "(NOT %s)" % self._row_lte_predicate(left, right)
+        if op == "gte":
+            return "(NOT %s)" % self._row_lt_predicate(left, right)
+        if op == "eq":
+            return self._row_eq_predicate(left, right)
+        if op == "ne":
+            return self._row_ne_predicate(left, right)
+        raise NotImplementedError("unknown row comparison %r" % op)
+
+    def _row_cmp(self, symbol, left, right):
+        return "(%s %s %s)" % (self.visit(left), symbol, self.visit(right))
+
+    def _row_sides(self, left, right):
+        rendered_left = [
+            self._row_element_sql(element) for element in left.elements
+        ]
+        rendered_right = [
+            self._row_element_sql(element) for element in right.elements
+        ]
+        return rendered_left, rendered_right
+
+    def _row_eq_predicate(self, left, right):
+        rendered_left, rendered_right = self._row_sides(left, right)
+        parts = [
+            "(%s = %s)" % (left_sql, right_sql)
+            for left_sql, right_sql in zip(rendered_left, rendered_right)
+        ]
+        return "(%s)" % " AND ".join(parts)
+
+    def _row_ne_predicate(self, left, right):
+        rendered_left, rendered_right = self._row_sides(left, right)
+        parts = [
+            "(%s <> %s)" % (left_sql, right_sql)
+            for left_sql, right_sql in zip(rendered_left, rendered_right)
+        ]
+        return "(%s)" % " OR ".join(parts)
+
+    def _row_lt_predicate(self, left, right):
+        rendered_left, rendered_right = self._row_sides(left, right)
+        parts = []
+        for index in range(len(left.elements)):
+            prefix = [
+                "(%s = %s)" % (rendered_left[i], rendered_right[i])
+                for i in range(index)
+            ]
+            current = "(%s < %s)" % (
+                rendered_left[index],
+                rendered_right[index],
+            )
+            parts.append("(%s)" % " AND ".join(prefix + [current]))
+        return "(%s)" % " OR ".join(parts)
+
+    def _row_lte_predicate(self, left, right):
+        rendered_left, rendered_right = self._row_sides(left, right)
+        parts = []
+        for index in range(len(left.elements)):
+            prefix = [
+                "(%s = %s)" % (rendered_left[i], rendered_right[i])
+                for i in range(index)
+            ]
+            current = "(%s < %s)" % (
+                rendered_left[index],
+                rendered_right[index],
+            )
+            parts.append("(%s)" % " AND ".join(prefix + [current]))
+        parts.append(
+            "(%s)"
+            % " AND ".join(
+                "(%s = %s)" % (left_sql, right_sql)
+                for left_sql, right_sql in zip(
+                    rendered_left, rendered_right
+                )
+            )
+        )
+        return "(%s)" % " OR ".join(parts)
+
+    def _unalias_node(self, node):
+        if isinstance(node, ast.Aliased):
+            return node.node
+        return node
+
+    def _row_match_predicate(self, left, right):
+        rendered_left, rendered_right = self._row_sides(left, right)
+        equalities = [
+            "(%s = %s)" % (left_sql, right_sql)
+            for left_sql, right_sql in zip(rendered_left, rendered_right)
+        ]
+        return "(%s)" % " AND ".join(equalities)
+
+    def _row_unknown_predicate(self, left, right):
+        rendered_left, rendered_right = self._row_sides(left, right)
+        alternatives = []
+        for null_index in range(len(left.elements)):
+            if null_index == 0:
+                continue
+            conditions = []
+            for index, (left_sql, right_sql) in enumerate(
+                zip(rendered_left, rendered_right)
+            ):
+                if index == null_index:
+                    conditions.append(
+                        "((%s IS NULL) OR (%s IS NULL))"
+                        % (
+                            left_sql,
+                            right_sql,
+                        )
+                    )
+                elif index < null_index:
+                    conditions.append("(%s = %s)" % (left_sql, right_sql))
+            alternatives.append("(%s)" % " AND ".join(conditions))
+        return "(%s)" % " OR ".join(alternatives)
+
+    def _exists_select(self, select, predicate, base_where=None):
+        inner_where = (
+            predicate
+            if base_where is None
+            else "(%s AND %s)" % (self.visit(select.where), predicate)
+        )
+        correlated_select = dataclasses.replace(
+            select, where=ast.Raw(inner_where)
+        )
+        body = self._compile_select_body(correlated_select)
+        if body.endswith(";"):
+            body = body[:-1]
+        return "EXISTS (%s)" % body
+
+    def _emulated_row_subquery_predicate(self, left, select, negated):
+        original_where = None
+        if select.where is not None and self._where_is_non_correlated(select):
+            original_where = True
+        right = ast.RowValue(
+            tuple(self._unalias_node(field) for field in select.fields),
+            tuple(getattr(field, "type", None) for field in select.fields),
+        )
+        match = self._row_match_predicate(left, right)
+        unknown = self._row_unknown_predicate(left, right)
+        match_exists = self._exists_select(select, match, original_where)
+        unknown_exists = self._exists_select(select, unknown, original_where)
+        match_condition = self._boolean_case_condition(match_exists)
+        unknown_condition = self._boolean_case_condition(unknown_exists)
+        if negated:
+            return (
+                "(CASE WHEN %s THEN 0 WHEN %s THEN NULL ELSE 1 END)"
+                % (match_condition, unknown_condition)
+            )
+        return "(CASE WHEN %s THEN 1 WHEN %s THEN NULL ELSE 0 END)" % (
+            match_condition,
+            unknown_condition,
+        )
+
+    def _boolean_case_condition(self, predicate):
+        if self.true_exp in ("1", "TRUE"):
+            return predicate
+        return "(%s = 1)" % self._numeric_boolean(predicate)
+
+    def _numeric_boolean(self, predicate):
+        return "(CASE WHEN %s THEN 1 ELSE 0 END)" % predicate
+
+    def _where_is_non_correlated(self, select):
+        outer_scope = self._scope_stack[-1] if self._scope_stack else frozenset()
+        local_tables = tuple(
+            source.name
+            for source in select.sources
+            if source.name not in outer_scope
+        )
+        return self._node_references_only_tables(select.where, local_tables)
+
+    def _node_references_only_tables(self, node, local_tables):
+        if isinstance(node, ast.BinOp) and node.op == "and":
+            return self._node_references_only_tables(
+                node.left, local_tables
+            ) and self._node_references_only_tables(node.right, local_tables)
+        return self._node_table_references(node).issubset(local_tables)
+
+    def _node_table_references(self, node):
+        if isinstance(node, ast.FieldRef):
+            return {node.table}
+        if dataclasses.is_dataclass(node):
+            referenced = set()
+            for item in dataclasses.fields(node):
+                referenced.update(
+                    self._node_table_references(getattr(node, item.name))
+                )
+            return referenced
+        if isinstance(node, (list, tuple)):
+            referenced = set()
+            for item in node:
+                referenced.update(self._node_table_references(item))
+            return referenced
+        return set()
 
     # ================================================================== ops
     # Comparisons, logical, arithmetic, ordering, null-predicates.
