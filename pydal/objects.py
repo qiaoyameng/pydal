@@ -3211,6 +3211,40 @@ class Set(Serializable):
         fields = adapter.expand_all(fields, tablenames)
         return adapter.nested_select(self.query, fields, attributes).with_alias(name)
 
+    def recursive_traverse(
+        self,
+        key,
+        link,
+        max_depth=None,
+        on_cycle="report",
+        name="walk",
+        fields=(),
+    ):
+        """
+        Build an explicit recursive traversal (``WITH RECURSIVE`` CTE)
+        rooted at this Set's query.
+
+        ``key`` is a Field (or sequence of Fields for composite keys)
+        identifying a node; ``link`` is a callable
+        ``(parent, child) -> Query`` describing one parent/child edge.
+        The returned CTE yields, per visited path, the node key fields,
+        ``depth``, the encoded ``path``, a ``cycle`` flag and a
+        ``truncated`` flag. See ``pydal.traversal.recursive_traverse``
+        for the full semantics (cycle policies, path encoding, depth
+        limiting, dialect support).
+        """
+        from .traversal import recursive_traverse
+
+        return recursive_traverse(
+            self,
+            key,
+            link,
+            max_depth=max_depth,
+            on_cycle=on_cycle,
+            name=name,
+            fields=fields,
+        )
+
     def delete(self):
         db = self.db
         table = db._adapter.get_table(self.query)

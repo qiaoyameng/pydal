@@ -160,6 +160,14 @@ def _expr_to_ast(expr) -> ast.Node:
             table=getattr(expr, "tablename", None),
         )
 
+    # ---------- constant value ----------
+    if name == "literal":
+        # Constant-value expression (used by pydal.traversal): ``first``
+        # is the Python value and the Expression's own ``type`` is the
+        # pydal type hint, so the compiler binds it as a parameter
+        # rather than inlining it into the SQL text.
+        return ast.Literal(f, expr.type)
+
     # ---------- comparisons (fold None into is_null/is_not_null) ----------
     if name in ("eq", "ne"):
         if s is None:

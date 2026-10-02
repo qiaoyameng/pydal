@@ -27,6 +27,7 @@ from .caching import TestCache
 from .contribs import *
 from .is_url_validators import *
 from .querybuilder import *
+from .recursive_traverse import *
 from .restapi import *
 from .scheduler import *
 from .smart_query import *

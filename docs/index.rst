@@ -49,6 +49,14 @@ pydal.objects module
     :undoc-members:
     :show-inheritance:
 
+pydal.traversal module
+------------------------
+
+.. automodule:: pydal.traversal
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 
 Module contents
 ---------------

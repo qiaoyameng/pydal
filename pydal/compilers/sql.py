@@ -1001,6 +1001,14 @@ class SQLCompiler:
             self.visit(args[2]),
         )
 
+    def fn_concat(self, args, _):
+        """Render ``(arg0 || arg1 || ...)`` — ANSI string concatenation."""
+        return "(%s)" % " || ".join(self.visit(a) for a in args)
+
+    def fn_exists(self, args, _):
+        """Render ``EXISTS (<subquery>)`` — arg0 renders as ``(SELECT ...)``."""
+        return "EXISTS %s" % self.visit(args[0])
+
     def fn_coalesce(self, args, _):
         """Render ``COALESCE(arg0, arg1, ...)`` over an arbitrary arg list."""
         return "COALESCE(%s)" % ",".join(self.visit(a) for a in args)

@@ -52,6 +52,10 @@ class SQLiteCompiler(SQLCompiler):
         """SQLite epoch via ``web2py_extract('epoch', ...)``."""
         return "web2py_extract('epoch', %s)" % self.visit(x)
 
+    def fn_instr(self, args, opts):
+        """SQLite ``INSTR(haystack, needle)``: 1-based position, 0 if absent."""
+        return "INSTR(%s, %s)" % (self.visit(args[0]), self.visit(args[1]))
+
     def op_regexp(self, l, r, _):
         """Render ``(left REGEXP right)`` — SQLite uses no ESCAPE clause."""
         return "(%s REGEXP %s)" % (

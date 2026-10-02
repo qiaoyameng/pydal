@@ -210,6 +210,13 @@ class SQLiteDialect(SQLDialect):
             self.expand(second, "string", query_env=query_env),
         )
 
+    def instr(self, first, second, query_env={}):
+        """INSTR(haystack, needle): 1-based position of needle, 0 if absent."""
+        return "INSTR(%s,%s)" % (
+            self.expand(first, "string", query_env=query_env),
+            self.expand(second, "string", query_env=query_env),
+        )
+
     def select(
         self,
         fields,
