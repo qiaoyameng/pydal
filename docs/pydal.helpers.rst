@@ -20,6 +20,14 @@ pydal.helpers.methods module
     :undoc-members:
     :show-inheritance:
 
+pydal.helpers.recursive module
+------------------------------
+
+.. automodule:: pydal.helpers.recursive
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 pydal.helpers.regex module
 ------------------------------
 

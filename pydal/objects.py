@@ -3211,6 +3211,24 @@ class Set(Serializable):
         fields = adapter.expand_all(fields, tablenames)
         return adapter.nested_select(self.query, fields, attributes).with_alias(name)
 
+    def recursive_walk(self, key=None, join=None, max_depth=None,
+                       on_cycle="report", name="walk"):
+        """
+        Explicit recursive traversal over this Set (the root query).
+
+        Builds a recursive CTE that walks the parent/child relation
+        expressed by ``join`` and yields the node columns plus
+        ``depth``, ``path``, ``cycle`` and ``truncated``. See
+        ``pydal.helpers.recursive.recursive_walk`` for the full
+        semantics (cycle policies, depth cap, path encoding).
+        """
+        from .helpers.recursive import recursive_walk
+
+        return recursive_walk(
+            self, key=key, join=join, max_depth=max_depth,
+            on_cycle=on_cycle, name=name,
+        )
+
     def delete(self):
         db = self.db
         table = db._adapter.get_table(self.query)

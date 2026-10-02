@@ -74,6 +74,33 @@ class TestCte(unittest.TestCase):
         # The select-from-cte SQL should carry 'alice' as a bound param.
         self.assertTrue(any(p and "alice" in p for _, p in seen if p))
 
+    def test_chained_ctes_emit_shared_dependency_once(self):
+        # Two outer CTEs both reading from one inner recursive CTE:
+        # the inner definition must be emitted exactly once, ahead of
+        # its consumers (SQLite rejects duplicate CTE names).
+        from pydal.objects import Expression
+
+        org = self.db.org
+        alice = org.insert(name="alice")
+        org.insert(name="bob", boss=alice)
+        inner = (
+            self.db(org.boss == None)  # noqa: E711
+            .cte(
+                "inner",
+                org.id,
+                Expression(self.db, "0", type="integer").with_alias("depth"),
+            )
+            .union_all(
+                lambda w: self.db(org.boss == w.id).nested_select(
+                    org.id, (w.depth + 1).with_alias("depth")
+                )
+            )
+        )
+        c1 = self.db().cte("c1", inner.id, inner.depth)
+        c2 = self.db().cte("c2", inner.id, inner.depth)
+        rows = self.db(c1.id == c2.id).select(c1.ALL, orderby=c1.id)
+        self.assertEqual([r.depth for r in rows], [0, 1])
+
 
 @unittest.skipIf(IS_NOSQL, "SQL-only")
 class TestSelectAsJoinSource(unittest.TestCase):

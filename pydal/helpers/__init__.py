@@ -15,4 +15,6 @@ specific layer:
 * ``serializers`` — JSON/XML/CSV serializer registry.
 * ``_internals`` — class-registry ``Dispatcher`` used by the
   dialect/parser/representer/compiler axes.
+* ``recursive`` — explicit recursive-traversal CTE constructor
+  (``Set.recursive_walk``).
 """

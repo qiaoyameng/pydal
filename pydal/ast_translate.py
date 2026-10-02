@@ -657,24 +657,76 @@ def _extract_ctes(tablemap):
     For each Select with is_cte=True in the tablemap, build an
     ast.Cte. The corresponding tablemap entry stays in place so the
     sources/joins builders see it as a (CTE-name) TableRef.
+
+    CTEs may reference other CTEs (e.g. an outer CTE whose body reads
+    from an inner recursive CTE). Dependencies are emitted before the
+    CTEs that reference them, each exactly once.
     """
     ctes = []
+    seen = set()
     for tname in list(tablemap):
         t = tablemap[tname]
         if isinstance(t, Select) and getattr(t, "is_cte", False):
-            ctes.append(_cte_to_ast(t))
+            if t._tablename in seen:
+                continue
+            seen.add(t._tablename)
+            ctes.extend(_cte_to_ast(t, seen))
     return tuple(ctes)
 
 
-def _cte_to_ast(sel) -> ast.Cte:
+def _cte_dependencies(sel):
+    """
+    CTE Selects referenced by ``sel``'s anchor body or recursive union
+    members (via their queries, select-fields, or join/order/group
+    attributes). Used to emit chained CTE definitions in dependency
+    order.
+    """
+    adapter = sel._db._adapter
+    attrs = sel._attributes
+    refs = [
+        sel._query,
+        attrs.get("join"),
+        attrs.get("left"),
+        attrs.get("orderby"),
+        attrs.get("groupby"),
+    ]
+    refs += list(sel._qfields)
+    for _, rec in sel._cte_recursive or []:
+        if isinstance(rec, Select):
+            refs.append(rec._query)
+            refs += list(rec._qfields)
+    deps = []
+    for t in adapter.tables(*[r for r in refs if r is not None]).values():
+        if isinstance(t, Select) and getattr(t, "is_cte", False):
+            deps.append(t)
+    return deps
+
+
+def _cte_to_ast(sel, seen=None):
     """
     Translate a pydal Select with is_cte=True into ast.Cte.
 
     The body Select is translated with correlated=False so the
     compiler's outer-scope pruning leaves the CTE's FROM clause alone.
     Recursive union members are translated the same way.
+
+    Returns a tuple of ast.Cte nodes: any not-yet-seen CTEs this one
+    depends on (dependencies first), followed by this CTE's own node.
+    ``seen`` is the caller's mutable set of already-emitted names —
+    shared across siblings so a common dependency is emitted once;
+    the CTE's own name must be in it (guards the recursive
+    self-reference).
     """
     from .objects import Set as _Set
+
+    if seen is None:
+        seen = set()
+    deps = []
+    for ref in _cte_dependencies(sel):
+        if ref._tablename in seen:
+            continue
+        seen.add(ref._tablename)
+        deps.extend(_cte_to_ast(ref, seen))
 
     def _column_name(f):
         # Mirror legacy: alias if set, else field name, else str(expr).
@@ -717,12 +769,13 @@ def _cte_to_ast(sel) -> ast.Cte:
                 )
         recursive_parts = tuple(parts)
 
-    return ast.Cte(
+    node = ast.Cte(
         name=sel._tablename,
         select=body_ast,
         columns=columns,
         recursive_parts=recursive_parts,
     )
+    return tuple(deps) + (node,)
 
 
 def _select_obj_to_subsource_ast(sel) -> ast.Node:
